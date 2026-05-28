@@ -344,6 +344,12 @@ impl TerminalEngine {
             }
         }
 
+        self.apply_hint_pass(&mut update);
+        update
+    }
+
+    /// URL auto-detect over the visible region; skips cells already hyperlinked (OSC 8).
+    fn apply_hint_pass(&mut self, update: &mut RenderUpdate) {
         if let Some(hint) = self.hint_regex.as_mut() {
             let off = self.term.grid().display_offset();
             let rows = self.term.screen_lines();
@@ -394,7 +400,6 @@ impl TerminalEngine {
                 }
             }
         }
-        update
     }
 
     /// Cells of a single viewport row.
@@ -573,7 +578,9 @@ impl TerminalEngine {
 
     pub fn take_damage(&mut self) -> RenderUpdate {
         if self.term.grid().display_offset() > 0 {
-            return self.full_snapshot();
+            let mut u = self.full_snapshot();
+            self.apply_hint_pass(&mut u);
+            return u;
         }
         // Collect damaged viewport rows, then drop the borrow before reading cells.
         let damaged: Option<Vec<usize>> = match self.term.damage() {
@@ -584,7 +591,7 @@ impl TerminalEngine {
 
         let (cursor_line, cursor_col, cursor_visible, cursor_shape, cursor_blinking) =
             self.cursor_fields();
-        match damaged {
+        let mut u = match damaged {
             None => {
                 let mut u = self.full_snapshot();
                 u.cursor_line = cursor_line;
@@ -616,7 +623,9 @@ impl TerminalEngine {
                     display_offset: 0,
                 }
             }
-        }
+        };
+        self.apply_hint_pass(&mut u);
+        u
     }
 }
 
@@ -985,6 +994,18 @@ mod tests {
         let uri = e.resolve_hyperlink(cell.hyperlink_id).unwrap();
         assert!(uri.starts_with("https://x.io/p"), "uri was {uri:?}");
         assert_eq!(u.lines[0].cells[2].flags & FLAG_HYPERLINK, 0);
+    }
+
+    #[test]
+    fn url_auto_detect_applies_on_take_damage_path() {
+        let mut e = engine(40, 3);
+        e.take_damage(); // drain initial full damage
+        e.advance(b"see https://x.io/p next".to_vec());
+        let u = e.take_damage();
+        let row = u.lines.iter().find(|l| l.line == 0).expect("row 0");
+        let cell = &row.cells[4];
+        assert_ne!(cell.flags & FLAG_HYPERLINK, 0);
+        assert_ne!(cell.hyperlink_id, 0);
     }
 
     #[test]
