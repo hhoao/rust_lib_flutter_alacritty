@@ -1,0 +1,5 @@
+# Cargokit build-tool dev tree (not needed at publish time).
+/cargokit/build_tool/.dart_tool/
+
+# Rust build output.
+/rust/target/
