@@ -52,7 +52,7 @@ pub fn engine_take_events(engine: &TerminalEngine) -> Vec<EngineEvent> {
 }
 
 #[frb(sync)]
-pub fn engine_full_snapshot(engine: &TerminalEngine) -> RenderUpdate {
+pub fn engine_full_snapshot(engine: &mut TerminalEngine) -> RenderUpdate {
     engine.full_snapshot()
 }
 
@@ -118,6 +118,12 @@ pub fn engine_search_prev(engine: &mut TerminalEngine) -> bool {
 #[frb(sync)]
 pub fn engine_search_clear(engine: &mut TerminalEngine) {
     engine.search_clear();
+}
+
+#[frb(sync)]
+pub fn engine_resolve_hyperlink(engine: &TerminalEngine, id: u32) -> Option<String> {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.resolve_hyperlink(id)))
+        .unwrap_or(None)
 }
 
 #[frb(sync)]

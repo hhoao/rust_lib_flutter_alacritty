@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::event_proxy::{EngineEvent, EventProxy, EventQueue};
@@ -16,6 +17,7 @@ pub struct CellData {
     pub fg: u32,
     pub bg: u32,
     pub flags: u16,
+    pub hyperlink_id: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +83,7 @@ pub const FLAG_STRIKEOUT: u16 = 1 << 7;
 pub const FLAG_SELECTED: u16 = 1 << 8;
 pub const FLAG_MATCH: u16 = 1 << 9;
 pub const FLAG_MATCH_CURRENT: u16 = 1 << 10;
+pub const FLAG_HYPERLINK: u16 = 1 << 11;
 
 const DEFAULT_FG: u32 = 0x00D8_D8D8;
 const DEFAULT_BG: u32 = 0x0018_1818;
@@ -149,6 +152,9 @@ pub struct TerminalEngine {
     palette: [u32; 18],
     search: Option<RegexSearch>,
     current_match: Option<Match>,
+    hyperlinks: Vec<String>,
+    hyperlink_ids: HashMap<String, u32>,
+    hint_regex: Option<RegexSearch>,
 }
 
 impl TerminalEngine {
@@ -170,6 +176,7 @@ impl TerminalEngine {
         let mut term = Term::new(term_config, &size, EventProxy::new(events.clone()));
         // Term boots with `damage.full`; clear so the first `take_damage` after input is partial.
         term.reset_damage();
+        let hint_regex = RegexSearch::new(r"(?:https?|ftp|file)://[^\s]+").ok();
         TerminalEngine {
             term,
             parser: Processor::new(),
@@ -177,6 +184,9 @@ impl TerminalEngine {
             palette,
             search: None,
             current_match: None,
+            hyperlinks: Vec::new(),
+            hyperlink_ids: HashMap::new(),
+            hint_regex,
         }
     }
 
@@ -260,6 +270,23 @@ impl TerminalEngine {
         self.current_match = None;
     }
 
+    fn intern_hyperlink(&mut self, uri: &str) -> u32 {
+        if let Some(&id) = self.hyperlink_ids.get(uri) {
+            return id;
+        }
+        let id = self.hyperlinks.len() as u32 + 1;
+        self.hyperlinks.push(uri.to_owned());
+        self.hyperlink_ids.insert(uri.to_owned(), id);
+        id
+    }
+
+    pub fn resolve_hyperlink(&self, id: u32) -> Option<String> {
+        if id == 0 {
+            return None;
+        }
+        self.hyperlinks.get((id - 1) as usize).cloned()
+    }
+
     fn search_step(&mut self, direction: Direction) -> bool {
         if self.search.is_none() {
             return false;
@@ -292,27 +319,77 @@ impl TerminalEngine {
 
     pub fn full_snapshot_searched(&mut self) -> RenderUpdate {
         let mut update = self.full_snapshot();
-        if self.search.is_none() {
-            return update;
-        }
-        let off = self.term.grid().display_offset();
-        let rows = self.term.screen_lines();
-        let cols = self.term.columns();
-        let current = self.current_match.clone();
-        let top = viewport_to_point(off, Point::new(0, Column(0)));
-        let bottom = viewport_to_point(off, Point::new(rows - 1, Column(cols - 1)));
-        let re = self.search.as_mut().unwrap();
-        let matches: Vec<Match> =
-            RegexIter::new(top, bottom, Direction::Right, &self.term, re).collect();
-        for line in update.lines.iter_mut() {
-            for col in 0..line.cells.len() {
-                let p = viewport_to_point(off, Point::new(line.line as usize, Column(col)));
-                if matches.iter().any(|m| point_in_match(p, m)) {
-                    line.cells[col].flags |= FLAG_MATCH;
+        if self.search.is_some() {
+            let off = self.term.grid().display_offset();
+            let rows = self.term.screen_lines();
+            let cols = self.term.columns();
+            let current = self.current_match.clone();
+            let top = viewport_to_point(off, Point::new(0, Column(0)));
+            let bottom = viewport_to_point(off, Point::new(rows - 1, Column(cols - 1)));
+            let re = self.search.as_mut().unwrap();
+            let matches: Vec<Match> =
+                RegexIter::new(top, bottom, Direction::Right, &self.term, re).collect();
+            for line in update.lines.iter_mut() {
+                for col in 0..line.cells.len() {
+                    let p = viewport_to_point(off, Point::new(line.line as usize, Column(col)));
+                    if matches.iter().any(|m| point_in_match(p, m)) {
+                        line.cells[col].flags |= FLAG_MATCH;
+                    }
+                    if let Some(m) = &current {
+                        if point_in_match(p, m) {
+                            line.cells[col].flags |= FLAG_MATCH_CURRENT;
+                        }
+                    }
                 }
-                if let Some(m) = &current {
-                    if point_in_match(p, m) {
-                        line.cells[col].flags |= FLAG_MATCH_CURRENT;
+            }
+        }
+
+        if let Some(hint) = self.hint_regex.as_mut() {
+            let off = self.term.grid().display_offset();
+            let rows = self.term.screen_lines();
+            let cols = self.term.columns();
+            let top = viewport_to_point(off, Point::new(0, Column(0)));
+            let bottom = viewport_to_point(off, Point::new(rows - 1, Column(cols - 1)));
+            let matches: Vec<Match> =
+                RegexIter::new(top, bottom, Direction::Right, &self.term, hint).collect();
+            let uris_for_matches: Vec<String> = matches
+                .iter()
+                .map(|m| {
+                    let mut s = String::new();
+                    let grid = self.term.grid();
+                    let (start, end) = (m.start(), m.end());
+                    let mut line = start.line;
+                    while line <= end.line {
+                        let col_start =
+                            if line == start.line { start.column.0 } else { 0 };
+                        let col_end = if line == end.line {
+                            end.column.0
+                        } else {
+                            grid.columns() - 1
+                        };
+                        for c in col_start..=col_end {
+                            s.push(grid[line][Column(c)].c);
+                        }
+                        line = Line(line.0 + 1);
+                    }
+                    s
+                })
+                .collect();
+            for (m, uri) in matches.iter().zip(uris_for_matches.into_iter()) {
+                let id = self.intern_hyperlink(&uri);
+                for line in update.lines.iter_mut() {
+                    for col in 0..line.cells.len() {
+                        if line.cells[col].flags & FLAG_HYPERLINK != 0 {
+                            continue;
+                        }
+                        let p = viewport_to_point(
+                            off,
+                            Point::new(line.line as usize, Column(col)),
+                        );
+                        if point_in_match(p, m) {
+                            line.cells[col].flags |= FLAG_HYPERLINK;
+                            line.cells[col].hyperlink_id = id;
+                        }
                     }
                 }
             }
@@ -321,13 +398,13 @@ impl TerminalEngine {
     }
 
     /// Cells of a single viewport row.
-    fn line_cells(&self, row: usize) -> Vec<CellData> {
+    fn line_cells(&mut self, row: usize) -> Vec<CellData> {
         let grid = self.term.grid();
         let cols = grid.columns();
-        let g_line = &grid[Line(row as i32)];
-        (0..cols)
-            .map(|col| self.cell_data(&g_line[Column(col)]))
-            .collect()
+        let cells_ref: Vec<Cell> = (0..cols)
+            .map(|c| grid[Line(row as i32)][Column(c)].clone())
+            .collect();
+        cells_ref.iter().map(|c| self.cell_data(c)).collect()
     }
 
     fn ansi16(&self, i: u8) -> u32 {
@@ -402,12 +479,17 @@ impl TerminalEngine {
         }
     }
 
-    fn cell_data(&self, cell: &Cell) -> CellData {
+    fn cell_data(&mut self, cell: &Cell) -> CellData {
+        let (hyperlink_id, hyperlink_flag) = match cell.hyperlink() {
+            Some(h) => (self.intern_hyperlink(h.uri()), FLAG_HYPERLINK),
+            None => (0, 0),
+        };
         CellData {
             codepoint: cell.c as u32,
             fg: self.resolve_color(cell.fg, true),
             bg: self.resolve_color(cell.bg, false),
-            flags: map_flags(cell.flags),
+            flags: map_flags(cell.flags) | hyperlink_flag,
+            hyperlink_id,
         }
     }
 
@@ -430,7 +512,7 @@ impl TerminalEngine {
         )
     }
 
-    pub fn full_snapshot(&self) -> RenderUpdate {
+    pub fn full_snapshot(&mut self) -> RenderUpdate {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
         let display_offset = self.term.grid().display_offset();
@@ -439,6 +521,7 @@ impl TerminalEngine {
             fg: self.palette[16],
             bg: self.palette[17],
             flags: 0,
+            hyperlink_id: 0,
         };
         let mut lines: Vec<LineUpdate> = (0..rows)
             .map(|r| LineUpdate {
@@ -451,18 +534,27 @@ impl TerminalEngine {
             .selection
             .as_ref()
             .and_then(|s| s.to_range(&self.term));
-        for indexed in self.term.grid().display_iter() {
-            if let Some(vp) = point_to_viewport(display_offset, indexed.point) {
-                if vp.line < rows && vp.column.0 < cols {
-                    let mut cd = self.cell_data(indexed.cell);
-                    if let Some(r) = &sel {
-                        if point_in_range(indexed.point, r) {
-                            cd.flags |= FLAG_SELECTED;
-                        }
+        let collected: Vec<(usize, usize, Cell)> = {
+            let grid = self.term.grid();
+            let mut out = Vec::new();
+            for indexed in grid.display_iter() {
+                if let Some(vp) = point_to_viewport(display_offset, indexed.point) {
+                    if vp.line < rows && vp.column.0 < cols {
+                        out.push((vp.line, vp.column.0, indexed.cell.clone()));
                     }
-                    lines[vp.line].cells[vp.column.0] = cd;
                 }
             }
+            out
+        };
+        for (vline, vcol, cell_ref) in collected {
+            let mut cd = self.cell_data(&cell_ref);
+            if let Some(r) = &sel {
+                let p = viewport_to_point(display_offset, Point::new(vline, Column(vcol)));
+                if point_in_range(p, r) {
+                    cd.flags |= FLAG_SELECTED;
+                }
+            }
+            lines[vline].cells[vcol] = cd;
         }
         let (cursor_line, cursor_col, cursor_visible, cursor_shape, cursor_blinking) =
             self.cursor_fields();
@@ -866,5 +958,53 @@ mod tests {
         e.search_clear();
         let u = e.full_snapshot_searched();
         assert_eq!(u.lines[0].cells[0].flags & FLAG_MATCH, 0);
+    }
+
+    #[test]
+    fn osc8_hyperlink_is_carried_on_cell_data() {
+        let mut e = engine(20, 3);
+        e.advance(b"\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\".to_vec());
+        let u = e.full_snapshot_searched();
+        let cell = &u.lines[0].cells[0];
+        assert_ne!(cell.flags & FLAG_HYPERLINK, 0);
+        assert_ne!(cell.hyperlink_id, 0);
+        assert_eq!(
+            e.resolve_hyperlink(cell.hyperlink_id).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn url_auto_detect_marks_visible_region() {
+        let mut e = engine(40, 3);
+        e.advance(b"see https://x.io/p next".to_vec());
+        let u = e.full_snapshot_searched();
+        let cell = &u.lines[0].cells[4];
+        assert_ne!(cell.flags & FLAG_HYPERLINK, 0);
+        assert_ne!(cell.hyperlink_id, 0);
+        let uri = e.resolve_hyperlink(cell.hyperlink_id).unwrap();
+        assert!(uri.starts_with("https://x.io/p"), "uri was {uri:?}");
+        assert_eq!(u.lines[0].cells[2].flags & FLAG_HYPERLINK, 0);
+    }
+
+    #[test]
+    fn resolve_hyperlink_returns_none_for_unknown_id() {
+        let e = engine(10, 3);
+        assert!(e.resolve_hyperlink(0).is_none());
+        assert!(e.resolve_hyperlink(999).is_none());
+    }
+
+    #[test]
+    fn osc8_wins_over_auto_detect_when_both_apply() {
+        let mut e = engine(40, 3);
+        e.advance(
+            b"\x1b]8;;https://osc8.example\x1b\\https://other.example\x1b]8;;\x1b\\".to_vec(),
+        );
+        let u = e.full_snapshot_searched();
+        let cell = &u.lines[0].cells[0];
+        assert_eq!(
+            e.resolve_hyperlink(cell.hyperlink_id).as_deref(),
+            Some("https://osc8.example")
+        );
     }
 }
