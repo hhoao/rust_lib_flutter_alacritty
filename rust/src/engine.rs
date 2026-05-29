@@ -641,6 +641,28 @@ impl TerminalEngine {
             }
             lines[vline].cells[vcol] = cd;
         }
+        // Selection is computed per-cell, but a wide (CJK) glyph spans two cells:
+        // the WIDE lead cell and its trailing WIDE_SPACER. Without binding them,
+        // a drag edge landing between the two would highlight only half the glyph.
+        // Mirror alacritty's renderer (Selection::contains_cell): if either half of
+        // a wide pair is selected, select both.
+        if sel.is_some() {
+            for line in lines.iter_mut() {
+                for c in 0..line.cells.len().saturating_sub(1) {
+                    let lead_wide = line.cells[c].flags & FLAG_WIDE != 0;
+                    let next_spacer = line.cells[c + 1].flags & FLAG_WIDE_SPACER != 0;
+                    if lead_wide && next_spacer {
+                        let selected = (line.cells[c].flags | line.cells[c + 1].flags)
+                            & FLAG_SELECTED
+                            != 0;
+                        if selected {
+                            line.cells[c].flags |= FLAG_SELECTED;
+                            line.cells[c + 1].flags |= FLAG_SELECTED;
+                        }
+                    }
+                }
+            }
+        }
         let (cursor_line, cursor_col, cursor_visible, cursor_shape, cursor_blinking) =
             self.cursor_fields();
         let (default_fg, default_bg, cursor_color) = self.chrome_colors();
@@ -978,6 +1000,39 @@ mod tests {
 
         e.selection_clear();
         assert!(e.selection_text().is_none());
+    }
+
+    #[test]
+    fn wide_char_selection_never_splits_glyph() {
+        // "中文" occupies cols 0-1 (中: WIDE lead + WIDE_SPACER) and 2-3 (文: ditto).
+        // A drag edge that lands between a glyph's two cells must still select the
+        // whole glyph, never half. Each case below puts a selection boundary inside
+        // exactly one glyph; without the wide-pair binding one of the two cells of
+        // that glyph would be left unselected.
+        let cases = [
+            // end at col 2 (lead of 文, right side) -> 文's spacer (col 3) excluded.
+            (0u16, false, 2u16, true),
+            // start at col 1 (spacer of 中, left side) -> 中's lead (col 0) excluded.
+            (1, false, 3, true),
+        ];
+        for (start_col, start_right, end_col, end_right) in cases {
+            let mut e = engine(20, 3);
+            e.advance("中文".as_bytes().to_vec());
+            e.selection_start(0, start_col, start_right, 0);
+            e.selection_update(0, end_col, end_right);
+            let u = e.full_snapshot();
+            let row0 = u.lines.iter().find(|l| l.line == 0).unwrap();
+            let sel = |c: usize| row0.cells[c].flags & FLAG_SELECTED != 0;
+            // At least one cell must be selected (guards against an empty range that
+            // would make the equality checks below pass vacuously).
+            assert!(
+                sel(0) || sel(1) || sel(2) || sel(3),
+                "selection produced no selected cells for \
+                 start=({start_col},{start_right}) end=({end_col},{end_right})"
+            );
+            assert_eq!(sel(0), sel(1), "中 half-selected");
+            assert_eq!(sel(2), sel(3), "文 half-selected");
+        }
     }
 
     #[test]
