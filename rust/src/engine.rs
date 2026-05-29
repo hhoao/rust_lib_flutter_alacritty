@@ -309,6 +309,18 @@ impl TerminalEngine {
         self.term.clear_screen(ClearMode::Saved);
     }
 
+    pub fn set_palette(&mut self, palette: Vec<u32>) {
+        if let Ok(p) = palette.try_into() {
+            self.palette = p;
+        }
+    }
+
+    pub fn reconfigure(&mut self, config: EngineConfig) {
+        self.set_palette(config.palette.clone());
+        let term_config = build_term_config(&config);
+        self.term.set_options(term_config);
+    }
+
     fn viewport_point(&self, display_row: i32, col: u16) -> Point {
         let d = self.term.grid().display_offset();
         viewport_to_point(d, Point::new(display_row.max(0) as usize, Column(col as usize)))
@@ -1142,6 +1154,19 @@ mod tests {
             })
             .expect("expected a PtyWrite cursor report");
         assert_eq!(report, b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn reconfigure_updates_scrollback_and_palette() {
+        let mut e = TerminalEngine::new(10, 2, EngineConfig::defaults());
+        let mut cfg = EngineConfig::defaults();
+        cfg.scrollback = 5;
+        cfg.palette[1] = 0x00AB_CDEF;
+        e.reconfigure(cfg);
+        e.advance(b"\x1b[31mR".to_vec());
+        let snap = e.full_snapshot();
+        let red_cell = &snap.lines[0].cells[0];
+        assert_eq!(red_cell.fg & 0x00FF_FFFF, 0x00AB_CDEF);
     }
 
     #[test]

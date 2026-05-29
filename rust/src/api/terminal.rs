@@ -150,3 +150,8 @@ pub fn engine_set_cell_pixels(engine: &mut TerminalEngine, width: u16, height: u
     engine.set_cell_pixels(width, height);
 }
 
+#[frb(sync)]
+pub fn engine_reconfigure(engine: &mut TerminalEngine, config: EngineConfig) {
+    engine.reconfigure(config);
+}
+
