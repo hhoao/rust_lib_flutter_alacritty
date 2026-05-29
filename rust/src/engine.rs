@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::event_proxy::{EngineEvent, EventProxy, EventQueue};
+use crate::event_proxy::{EngineEvent, EventProxy, EventQueue, ReplyQueue};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -37,6 +37,9 @@ pub struct RenderUpdate {
     pub cursor_blinking: bool,
     pub mode_flags: u32,
     pub display_offset: u32,
+    pub default_fg: u32,
+    pub default_bg: u32,
+    pub cursor_color: u32,
 }
 
 impl RenderUpdate {
@@ -88,8 +91,17 @@ pub const FLAG_HYPERLINK: u16 = 1 << 11;
 const DEFAULT_FG: u32 = 0x00D8_D8D8;
 const DEFAULT_BG: u32 = 0x0018_1818;
 
+/// Sentinel `cursor_color` when no program has set OSC 12. Impossible as a
+/// real packed color (`pack` always yields `0x00RRGGBB`), so Dart can
+/// distinguish "unset → keep inverse-video cursor" from a real cursor color.
+pub const CURSOR_COLOR_UNSET: u32 = 0xFF00_0000;
+
 fn pack(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn unpack(v: u32) -> Rgb {
+    Rgb { r: (v >> 16) as u8, g: (v >> 8) as u8, b: v as u8 }
 }
 
 fn map_flags(f: Flags) -> u16 {
@@ -149,6 +161,7 @@ pub struct TerminalEngine {
     term: Term<EventProxy>,
     parser: Processor,
     events: EventQueue,
+    replies: ReplyQueue,
     palette: [u32; 18],
     search: Option<RegexSearch>,
     current_match: Option<Match>,
@@ -169,11 +182,12 @@ impl TerminalEngine {
             .try_into()
             .unwrap_or_else(|_| EngineConfig::default_palette());
         let events: EventQueue = Arc::new(Mutex::new(Vec::new()));
+        let replies: ReplyQueue = Arc::new(Mutex::new(Vec::new()));
         let term_config = Config {
             scrolling_history: config.scrollback as usize,
             ..Default::default()
         };
-        let mut term = Term::new(term_config, &size, EventProxy::new(events.clone()));
+        let mut term = Term::new(term_config, &size, EventProxy::new(events.clone(), replies.clone()));
         // Term boots with `damage.full`; clear so the first `take_damage` after input is partial.
         term.reset_damage();
         let hint_regex = RegexSearch::new(r"(?:https?|ftp|file)://[^\s]+").ok();
@@ -181,6 +195,7 @@ impl TerminalEngine {
             term,
             parser: Processor::new(),
             events,
+            replies,
             palette,
             search: None,
             current_match: None,
@@ -196,6 +211,7 @@ impl TerminalEngine {
 
     pub fn advance(&mut self, bytes: Vec<u8>) {
         self.parser.advance(&mut self.term, &bytes);
+        self.resolve_pending_replies();
     }
 
     pub fn resize(&mut self, columns: u16, rows: u16) {
@@ -413,7 +429,7 @@ impl TerminalEngine {
     }
 
     fn ansi16(&self, i: u8) -> u32 {
-        self.palette[i as usize]
+        self.live(i as usize, self.palette[i as usize])
     }
 
     fn xterm256(&self, i: u8) -> u32 {
@@ -437,8 +453,8 @@ impl TerminalEngine {
     fn resolve_named(&self, c: NamedColor) -> u32 {
         use NamedColor::*;
         match c {
-            Foreground | BrightForeground => self.palette[16],
-            Background => self.palette[17],
+            Foreground | BrightForeground => self.live_named(NamedColor::Foreground, self.palette[16]),
+            Background => self.live_named(NamedColor::Background, self.palette[17]),
             Black => self.ansi16(0),
             Red => self.ansi16(1),
             Green => self.ansi16(2),
@@ -455,7 +471,7 @@ impl TerminalEngine {
             BrightMagenta => self.ansi16(13),
             BrightCyan => self.ansi16(14),
             BrightWhite => self.ansi16(15),
-            Cursor => self.palette[16],
+            Cursor => self.live_named(NamedColor::Cursor, self.palette[16]),
             DimBlack => self.ansi16(0),
             DimRed => self.ansi16(1),
             DimGreen => self.ansi16(2),
@@ -464,7 +480,7 @@ impl TerminalEngine {
             DimMagenta => self.ansi16(5),
             DimCyan => self.ansi16(6),
             DimWhite => self.ansi16(7),
-            DimForeground => self.palette[16],
+            DimForeground => self.live_named(NamedColor::Foreground, self.palette[16]),
         }
     }
 
@@ -480,6 +496,70 @@ impl TerminalEngine {
                 } else {
                     self.palette[17]
                 }
+            }
+        }
+    }
+
+    /// Live packed color for an alacritty color-array slot, honoring runtime
+    /// OSC SET. Falls back to our static config palette value when unset.
+    /// Mirrors alacritty `display/content.rs`: `colors[i].unwrap_or(config[i])`.
+    fn live(&self, idx: usize, fallback: u32) -> u32 {
+        match self.term.colors()[idx] {
+            Some(c) => pack(c.r, c.g, c.b),
+            None => fallback,
+        }
+    }
+
+    fn live_named(&self, n: NamedColor, fallback: u32) -> u32 {
+        self.live(n as usize, fallback)
+    }
+
+    /// (default_fg, default_bg, cursor_color) for the snapshot chrome header.
+    /// cursor_color is CURSOR_COLOR_UNSET unless a program set OSC 12.
+    fn chrome_colors(&self) -> (u32, u32, u32) {
+        let cursor_color = match self.term.colors()[NamedColor::Cursor as usize] {
+            Some(c) => pack(c.r, c.g, c.b),
+            None => CURSOR_COLOR_UNSET,
+        };
+        (
+            self.live_named(NamedColor::Foreground, self.palette[16]),
+            self.live_named(NamedColor::Background, self.palette[17]),
+            cursor_color,
+        )
+    }
+
+    /// Config-default Rgb for an OSC color index (used when term.colors[i] is
+    /// unset). Mirrors alacritty's `display.colors[index]` fallback table, scoped
+    /// to the indices our compact palette covers.
+    fn config_default_rgb(&self, index: usize) -> Rgb {
+        let packed = match index {
+            0..=15 => self.palette[index],
+            16..=255 => self.xterm256(index as u8),
+            i if i == NamedColor::Foreground as usize => self.palette[16],
+            i if i == NamedColor::Background as usize => self.palette[17],
+            _ => self.palette[16],
+        };
+        unpack(packed)
+    }
+
+    /// Current Rgb for an OSC color query. `None` => emit no reply (matches
+    /// alacritty: an unset cursor-color query is ignored).
+    fn query_color_rgb(&self, index: usize) -> Option<Rgb> {
+        match self.term.colors()[index] {
+            Some(c) => Some(c),
+            None if index == NamedColor::Cursor as usize => None,
+            None => Some(self.config_default_rgb(index)),
+        }
+    }
+
+    /// Drain pending OSC color queries into PtyWrite replies. Called after the
+    /// parser has finished (term no longer mutably borrowed by `parser.advance`).
+    fn resolve_pending_replies(&mut self) {
+        let pending = std::mem::take(&mut *self.replies.lock().unwrap());
+        for r in pending {
+            if let Some(rgb) = self.query_color_rgb(r.index) {
+                let bytes = (r.formatter)(rgb).into_bytes();
+                self.events.lock().unwrap().push(EngineEvent::PtyWrite(bytes));
             }
         }
     }
@@ -523,8 +603,8 @@ impl TerminalEngine {
         let display_offset = self.term.grid().display_offset();
         let blank = CellData {
             codepoint: ' ' as u32,
-            fg: self.palette[16],
-            bg: self.palette[17],
+            fg: self.live_named(NamedColor::Foreground, self.palette[16]),
+            bg: self.live_named(NamedColor::Background, self.palette[17]),
             flags: 0,
             hyperlink_id: 0,
         };
@@ -563,6 +643,7 @@ impl TerminalEngine {
         }
         let (cursor_line, cursor_col, cursor_visible, cursor_shape, cursor_blinking) =
             self.cursor_fields();
+        let (default_fg, default_bg, cursor_color) = self.chrome_colors();
         RenderUpdate {
             lines,
             full: true,
@@ -573,6 +654,9 @@ impl TerminalEngine {
             cursor_blinking,
             mode_flags: self.term.mode().bits(),
             display_offset: display_offset as u32,
+            default_fg,
+            default_bg,
+            cursor_color,
         }
     }
 
@@ -611,6 +695,7 @@ impl TerminalEngine {
                         cells: self.line_cells(row),
                     })
                     .collect();
+                let (default_fg, default_bg, cursor_color) = self.chrome_colors();
                 RenderUpdate {
                     lines,
                     full: false,
@@ -621,6 +706,9 @@ impl TerminalEngine {
                     cursor_blinking,
                     mode_flags: self.term.mode().bits(),
                     display_offset: 0,
+                    default_fg,
+                    default_bg,
+                    cursor_color,
                 }
             }
         };
@@ -642,6 +730,75 @@ mod tests {
     }
     fn ch(u: &RenderUpdate, row: u32, col: usize) -> char {
         char::from_u32(line(u, row).cells[col].codepoint).unwrap()
+    }
+
+    fn pty_writes(e: &TerminalEngine) -> Vec<Vec<u8>> {
+        e.take_events()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                EngineEvent::PtyWrite(b) => Some(b),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn osc11_set_changes_default_bg_and_cells() {
+        let mut e = engine(10, 3);
+        // OSC 11 ; rgb:ff/00/00  (set default background to pure red), ST-terminated.
+        e.advance(b"\x1b]11;rgb:ff/00/00\x1b\\".to_vec());
+        let u = e.full_snapshot();
+        assert_eq!(u.default_bg, 0x00FF_0000, "chrome default_bg follows OSC 11");
+        // A blank cell (no explicit bg) must repack to the live default bg.
+        assert_eq!(line(&u, 0).cells[0].bg, 0x00FF_0000, "blank cell uses live bg");
+    }
+
+    #[test]
+    fn osc111_reset_reverts_default_bg_to_config() {
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b]11;rgb:ff/00/00\x1b\\".to_vec());
+        e.advance(b"\x1b]111\x1b\\".to_vec()); // reset default background
+        let u = e.full_snapshot();
+        assert_eq!(u.default_bg, EngineConfig::default_palette()[17]);
+    }
+
+    #[test]
+    fn cursor_color_unset_sentinel_then_osc12() {
+        let mut e = engine(10, 3);
+        assert_eq!(e.full_snapshot().cursor_color, CURSOR_COLOR_UNSET);
+        e.advance(b"\x1b]12;rgb:00/ff/00\x1b\\".to_vec()); // set cursor color green
+        assert_eq!(e.full_snapshot().cursor_color, 0x0000_FF00);
+    }
+
+    #[test]
+    fn osc11_query_emits_background_reply() {
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b]11;?\x1b\\".to_vec()); // query default background
+        let writes = pty_writes(&e);
+        assert_eq!(writes.len(), 1, "exactly one reply");
+        assert!(
+            writes[0].starts_with(b"\x1b]11;rgb:"),
+            "OSC 11 reply prefix, got {:?}",
+            String::from_utf8_lossy(&writes[0])
+        );
+    }
+
+    #[test]
+    fn osc11_query_reflects_live_color() {
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b]11;rgb:ff/00/00\x1b\\".to_vec()); // set red
+        let _ = e.take_events(); // drain set (no reply for SET)
+        e.advance(b"\x1b]11;?\x1b\\".to_vec()); // query
+        let writes = pty_writes(&e);
+        let s = String::from_utf8_lossy(&writes[0]);
+        assert!(s.contains("rgb:ffff/0000/0000"), "reply carries SET value, got {s}");
+    }
+
+    #[test]
+    fn osc12_query_ignored_when_cursor_unset() {
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b]12;?\x1b\\".to_vec()); // query cursor color, never set
+        assert!(pty_writes(&e).is_empty(), "unset cursor query is dropped (alacritty parity)");
     }
 
     #[test]

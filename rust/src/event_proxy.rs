@@ -1,6 +1,20 @@
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::vte::ansi::Rgb;
+
+/// A deferred OSC color-query reply. The formatter is alacritty's own reply
+/// builder; we feed it the current color after parsing finishes (the proxy
+/// can't read term state during `parser.advance`). Not serializable — never
+/// part of `EngineEvent`.
+#[derive(Clone)]
+pub struct ColorReply {
+    pub index: usize,
+    pub formatter: Arc<dyn Fn(Rgb) -> String + Send + Sync>,
+}
+
+/// Side queue of pending color-query replies (parallel to `EventQueue`).
+pub type ReplyQueue = Arc<Mutex<Vec<ColorReply>>>;
 
 /// Serializable terminal→host events (mirrored to Dart by FRB).
 #[derive(Clone, Debug, PartialEq)]
@@ -20,11 +34,12 @@ pub type EventQueue = Arc<Mutex<Vec<EngineEvent>>>;
 #[derive(Clone)]
 pub struct EventProxy {
     queue: EventQueue,
+    replies: ReplyQueue,
 }
 
 impl EventProxy {
-    pub fn new(queue: EventQueue) -> Self {
-        Self { queue }
+    pub fn new(queue: EventQueue, replies: ReplyQueue) -> Self {
+        Self { queue, replies }
     }
     fn emit(&self, e: EngineEvent) {
         self.queue.lock().unwrap().push(e);
@@ -39,11 +54,17 @@ impl EventListener for EventProxy {
             Event::ResetTitle => self.emit(EngineEvent::ResetTitle),
             Event::Bell => self.emit(EngineEvent::Bell),
             Event::ClipboardStore(_, s) => self.emit(EngineEvent::ClipboardStore(s)),
-            // App reads clipboard (OSC52 paste): answer empty for Plan 2A.
+            // App reads clipboard (OSC52 paste): answer empty for now (2N-b).
             Event::ClipboardLoad(_, format) => {
                 self.emit(EngineEvent::PtyWrite(format("").into_bytes()))
             }
-            // ColorRequest / TextAreaSizeRequest need engine state → deferred.
+            // OSC 4/10/11/12 query: stash for post-advance resolution (the proxy
+            // has no color state mid-parse). Resolved by the engine into PtyWrite.
+            Event::ColorRequest(index, formatter) => {
+                self.replies.lock().unwrap().push(ColorReply { index, formatter });
+            }
+            // TextAreaSizeRequest / CursorBlinkingChange / MouseCursorDirty /
+            // Wakeup / Exit / ChildExit — out of 2N scope (see 2N-b).
             _ => {}
         }
     }
@@ -55,7 +76,8 @@ mod tests {
 
     fn collector() -> (EventProxy, EventQueue) {
         let store: EventQueue = Arc::new(Mutex::new(Vec::new()));
-        (EventProxy::new(store.clone()), store)
+        let replies: ReplyQueue = Arc::new(Mutex::new(Vec::new()));
+        (EventProxy::new(store.clone(), replies), store)
     }
 
     #[test]

@@ -29,6 +29,9 @@ pub async fn engine_take_damage(engine: &mut TerminalEngine) -> RenderUpdate {
             cursor_blinking: false,
             mode_flags: 0,
             display_offset: 0,
+            default_fg: crate::engine::EngineConfig::default_palette()[16],
+            default_bg: crate::engine::EngineConfig::default_palette()[17],
+            cursor_color: crate::engine::CURSOR_COLOR_UNSET,
         }
     })
 }

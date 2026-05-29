@@ -1338,6 +1338,9 @@ impl SseDecode for crate::engine::RenderUpdate {
         let mut var_cursorBlinking = <bool>::sse_decode(deserializer);
         let mut var_modeFlags = <u32>::sse_decode(deserializer);
         let mut var_displayOffset = <u32>::sse_decode(deserializer);
+        let mut var_defaultFg = <u32>::sse_decode(deserializer);
+        let mut var_defaultBg = <u32>::sse_decode(deserializer);
+        let mut var_cursorColor = <u32>::sse_decode(deserializer);
         return crate::engine::RenderUpdate {
             lines: var_lines,
             full: var_full,
@@ -1348,6 +1351,9 @@ impl SseDecode for crate::engine::RenderUpdate {
             cursor_blinking: var_cursorBlinking,
             mode_flags: var_modeFlags,
             display_offset: var_displayOffset,
+            default_fg: var_defaultFg,
+            default_bg: var_defaultBg,
+            cursor_color: var_cursorColor,
         };
     }
 }
@@ -1564,6 +1570,9 @@ impl flutter_rust_bridge::IntoDart for crate::engine::RenderUpdate {
             self.cursor_blinking.into_into_dart().into_dart(),
             self.mode_flags.into_into_dart().into_dart(),
             self.display_offset.into_into_dart().into_dart(),
+            self.default_fg.into_into_dart().into_dart(),
+            self.default_bg.into_into_dart().into_dart(),
+            self.cursor_color.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1744,6 +1753,9 @@ impl SseEncode for crate::engine::RenderUpdate {
         <bool>::sse_encode(self.cursor_blinking, serializer);
         <u32>::sse_encode(self.mode_flags, serializer);
         <u32>::sse_encode(self.display_offset, serializer);
+        <u32>::sse_encode(self.default_fg, serializer);
+        <u32>::sse_encode(self.default_bg, serializer);
+        <u32>::sse_encode(self.cursor_color, serializer);
     }
 }
 
