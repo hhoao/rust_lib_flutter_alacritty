@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::event_proxy::{EngineEvent, EventProxy, EventQueue, ReplyQueue};
+use crate::event_proxy::{
+    ClipboardReplyQueue, EngineEvent, EventProxy, EventQueue, ReplyQueue, SizeReplyQueue,
+};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -56,6 +58,10 @@ impl RenderUpdate {
 pub struct EngineConfig {
     pub palette: Vec<u32>,
     pub scrollback: u32,
+    pub osc52: u8,
+    pub semantic_escape_chars: String,
+    pub default_cursor_shape: u8,
+    pub default_cursor_blinking: bool,
 }
 
 impl EngineConfig {
@@ -70,7 +76,42 @@ impl EngineConfig {
     }
 
     pub fn defaults() -> EngineConfig {
-        EngineConfig { palette: Self::default_palette().to_vec(), scrollback: 10000 }
+        EngineConfig {
+            palette: Self::default_palette().to_vec(),
+            scrollback: 10000,
+            osc52: 1,
+            semantic_escape_chars: String::from(",│`|:\"' ()[]{}<>\t"),
+            default_cursor_shape: 0,
+            default_cursor_blinking: false,
+        }
+    }
+}
+
+fn build_term_config(c: &EngineConfig) -> Config {
+    use alacritty_terminal::term::Osc52;
+    use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
+    let osc52 = match c.osc52 {
+        0 => Osc52::Disabled,
+        2 => Osc52::OnlyPaste,
+        3 => Osc52::CopyPaste,
+        _ => Osc52::OnlyCopy,
+    };
+    let shape = match c.default_cursor_shape {
+        1 => CursorShape::Underline,
+        2 => CursorShape::Beam,
+        3 => CursorShape::HollowBlock,
+        4 => CursorShape::Hidden,
+        _ => CursorShape::Block,
+    };
+    Config {
+        scrolling_history: c.scrollback as usize,
+        semantic_escape_chars: c.semantic_escape_chars.clone(),
+        default_cursor_style: CursorStyle {
+            shape,
+            blinking: c.default_cursor_blinking,
+        },
+        osc52,
+        ..Default::default()
     }
 }
 
@@ -162,6 +203,10 @@ pub struct TerminalEngine {
     parser: Processor,
     events: EventQueue,
     replies: ReplyQueue,
+    clipboard: ClipboardReplyQueue,
+    sizes: SizeReplyQueue,
+    cell_w: u16,
+    cell_h: u16,
     palette: [u32; 18],
     search: Option<RegexSearch>,
     current_match: Option<Match>,
@@ -176,6 +221,7 @@ impl TerminalEngine {
             columns as usize,
             rows as usize,
         );
+        let term_config = build_term_config(&config);
         // Length-guard: Dart always sends 18; fall back defensively if not.
         let palette: [u32; 18] = config
             .palette
@@ -183,11 +229,18 @@ impl TerminalEngine {
             .unwrap_or_else(|_| EngineConfig::default_palette());
         let events: EventQueue = Arc::new(Mutex::new(Vec::new()));
         let replies: ReplyQueue = Arc::new(Mutex::new(Vec::new()));
-        let term_config = Config {
-            scrolling_history: config.scrollback as usize,
-            ..Default::default()
-        };
-        let mut term = Term::new(term_config, &size, EventProxy::new(events.clone(), replies.clone()));
+        let clipboard: ClipboardReplyQueue = Arc::new(Mutex::new(Vec::new()));
+        let sizes: SizeReplyQueue = Arc::new(Mutex::new(Vec::new()));
+        let mut term = Term::new(
+            term_config,
+            &size,
+            EventProxy::new(
+                events.clone(),
+                replies.clone(),
+                clipboard.clone(),
+                sizes.clone(),
+            ),
+        );
         // Term boots with `damage.full`; clear so the first `take_damage` after input is partial.
         term.reset_damage();
         let hint_regex = RegexSearch::new(r"(?:https?|ftp|file)://[^\s]+").ok();
@@ -196,6 +249,10 @@ impl TerminalEngine {
             parser: Processor::new(),
             events,
             replies,
+            clipboard,
+            sizes,
+            cell_w: 0,
+            cell_h: 0,
             palette,
             search: None,
             current_match: None,
@@ -207,6 +264,23 @@ impl TerminalEngine {
 
     pub fn take_events(&self) -> Vec<EngineEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
+    }
+
+    pub fn has_pending_clipboard(&self) -> bool {
+        !self.clipboard.lock().unwrap().is_empty()
+    }
+
+    pub fn respond_clipboard_load(&mut self, text: String) {
+        let pending: Vec<_> = std::mem::take(&mut *self.clipboard.lock().unwrap());
+        for r in pending {
+            let bytes = (r.formatter)(&text).into_bytes();
+            self.events.lock().unwrap().push(EngineEvent::PtyWrite(bytes));
+        }
+    }
+
+    pub fn set_cell_pixels(&mut self, w: u16, h: u16) {
+        self.cell_w = w;
+        self.cell_h = h;
     }
 
     pub fn advance(&mut self, bytes: Vec<u8>) {
@@ -564,6 +638,20 @@ impl TerminalEngine {
         for r in pending {
             if let Some(rgb) = self.query_color_rgb(r.index) {
                 let bytes = (r.formatter)(rgb).into_bytes();
+                self.events.lock().unwrap().push(EngineEvent::PtyWrite(bytes));
+            }
+        }
+
+        let sizes: Vec<_> = std::mem::take(&mut *self.sizes.lock().unwrap());
+        if !sizes.is_empty() {
+            let size = alacritty_terminal::event::WindowSize {
+                num_lines: self.term.screen_lines() as u16,
+                num_cols: self.term.columns() as u16,
+                cell_width: self.cell_w,
+                cell_height: self.cell_h,
+            };
+            for r in sizes {
+                let bytes = (r.formatter)(size).into_bytes();
                 self.events.lock().unwrap().push(EngineEvent::PtyWrite(bytes));
             }
         }
@@ -1060,7 +1148,11 @@ mod tests {
     fn palette_injection_overrides_ansi_colors() {
         let mut pal = EngineConfig::default_palette();
         pal[1] = 0x0011_2233;
-        let cfg = EngineConfig { palette: pal.to_vec(), scrollback: 1000 };
+        let cfg = EngineConfig {
+            palette: pal.to_vec(),
+            scrollback: 1000,
+            ..EngineConfig::defaults()
+        };
         let mut e = TerminalEngine::new(20, 5, cfg);
         e.advance(b"\x1b[31mR".to_vec());
         let u = e.full_snapshot();
@@ -1257,5 +1349,42 @@ mod tests {
             e.resolve_hyperlink(cell.hyperlink_id).as_deref(),
             Some("https://osc8.example")
         );
+    }
+
+    #[test]
+    fn osc52_paste_round_trips_when_enabled() {
+        let mut cfg = EngineConfig::defaults();
+        cfg.osc52 = 3;
+        let mut e = TerminalEngine::new(10, 2, cfg);
+        e.advance(b"\x1b]52;c;?\x07".to_vec());
+        assert!(e.has_pending_clipboard());
+        e.respond_clipboard_load("hello".to_string());
+        let evs = e.take_events();
+        let wrote = evs.iter().any(|ev| {
+            matches!(ev, EngineEvent::PtyWrite(b)
+                if String::from_utf8_lossy(b).contains("52;c;")
+                && String::from_utf8_lossy(b).contains("aGVsbG8="))
+        });
+        assert!(wrote, "expected base64('hello')=aGVsbG8= reply, got {evs:?}");
+    }
+
+    #[test]
+    fn osc52_paste_denied_by_default() {
+        let mut e = TerminalEngine::new(10, 2, EngineConfig::defaults());
+        e.advance(b"\x1b]52;c;?\x07".to_vec());
+        assert!(!e.has_pending_clipboard());
+    }
+
+    #[test]
+    fn text_area_size_request_replies_with_pixels() {
+        let mut e = TerminalEngine::new(80, 24, EngineConfig::defaults());
+        e.set_cell_pixels(9, 18);
+        e.advance(b"\x1b[14t".to_vec());
+        let evs = e.take_events();
+        let ok = evs.iter().any(|ev| {
+            matches!(ev, EngineEvent::PtyWrite(b)
+                if String::from_utf8_lossy(b).contains("4;432;720t"))
+        });
+        assert!(ok, "got {evs:?}");
     }
 }

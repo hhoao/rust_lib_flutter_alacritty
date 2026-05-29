@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::vte::ansi::Rgb;
 
 /// A deferred OSC color-query reply. The formatter is alacritty's own reply
@@ -16,6 +16,23 @@ pub struct ColorReply {
 /// Side queue of pending color-query replies (parallel to `EventQueue`).
 pub type ReplyQueue = Arc<Mutex<Vec<ColorReply>>>;
 
+/// A deferred OSC 52 paste reply: alacritty's formatter, applied to the
+/// system clipboard text the host fetches asynchronously.
+#[derive(Clone)]
+pub struct ClipboardReply {
+    pub formatter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+}
+
+pub type ClipboardReplyQueue = Arc<Mutex<Vec<ClipboardReply>>>;
+
+/// A deferred text-area size reply (CSI 14/18 t).
+#[derive(Clone)]
+pub struct SizeReply {
+    pub formatter: Arc<dyn Fn(WindowSize) -> String + Send + Sync>,
+}
+
+pub type SizeReplyQueue = Arc<Mutex<Vec<SizeReply>>>;
+
 /// Serializable terminal→host events (mirrored to Dart by FRB).
 #[derive(Clone, Debug, PartialEq)]
 pub enum EngineEvent {
@@ -24,6 +41,7 @@ pub enum EngineEvent {
     ResetTitle,
     Bell,
     ClipboardStore(String),
+    ClipboardLoad,
 }
 
 /// Shared, thread-safe event queue owned by the engine and filled by the proxy.
@@ -35,11 +53,23 @@ pub type EventQueue = Arc<Mutex<Vec<EngineEvent>>>;
 pub struct EventProxy {
     queue: EventQueue,
     replies: ReplyQueue,
+    clipboard: ClipboardReplyQueue,
+    sizes: SizeReplyQueue,
 }
 
 impl EventProxy {
-    pub fn new(queue: EventQueue, replies: ReplyQueue) -> Self {
-        Self { queue, replies }
+    pub fn new(
+        queue: EventQueue,
+        replies: ReplyQueue,
+        clipboard: ClipboardReplyQueue,
+        sizes: SizeReplyQueue,
+    ) -> Self {
+        Self {
+            queue,
+            replies,
+            clipboard,
+            sizes,
+        }
     }
     fn emit(&self, e: EngineEvent) {
         self.queue.lock().unwrap().push(e);
@@ -54,17 +84,19 @@ impl EventListener for EventProxy {
             Event::ResetTitle => self.emit(EngineEvent::ResetTitle),
             Event::Bell => self.emit(EngineEvent::Bell),
             Event::ClipboardStore(_, s) => self.emit(EngineEvent::ClipboardStore(s)),
-            // App reads clipboard (OSC52 paste): answer empty for now (2N-b).
             Event::ClipboardLoad(_, format) => {
-                self.emit(EngineEvent::PtyWrite(format("").into_bytes()))
+                self.clipboard
+                    .lock()
+                    .unwrap()
+                    .push(ClipboardReply { formatter: format });
+                self.emit(EngineEvent::ClipboardLoad);
             }
-            // OSC 4/10/11/12 query: stash for post-advance resolution (the proxy
-            // has no color state mid-parse). Resolved by the engine into PtyWrite.
             Event::ColorRequest(index, formatter) => {
                 self.replies.lock().unwrap().push(ColorReply { index, formatter });
             }
-            // TextAreaSizeRequest / CursorBlinkingChange / MouseCursorDirty /
-            // Wakeup / Exit / ChildExit — out of 2N scope (see 2N-b).
+            Event::TextAreaSizeRequest(format) => {
+                self.sizes.lock().unwrap().push(SizeReply { formatter: format });
+            }
             _ => {}
         }
     }
@@ -77,7 +109,12 @@ mod tests {
     fn collector() -> (EventProxy, EventQueue) {
         let store: EventQueue = Arc::new(Mutex::new(Vec::new()));
         let replies: ReplyQueue = Arc::new(Mutex::new(Vec::new()));
-        (EventProxy::new(store.clone(), replies), store)
+        let clipboard: ClipboardReplyQueue = Arc::new(Mutex::new(Vec::new()));
+        let sizes: SizeReplyQueue = Arc::new(Mutex::new(Vec::new()));
+        (
+            EventProxy::new(store.clone(), replies, clipboard, sizes),
+            store,
+        )
     }
 
     #[test]

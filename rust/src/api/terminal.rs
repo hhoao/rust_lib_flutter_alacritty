@@ -139,3 +139,13 @@ pub fn engine_full_snapshot_searched(engine: &mut TerminalEngine) -> RenderUpdat
     std::panic::catch_unwind(AssertUnwindSafe(|| engine.full_snapshot_searched()))
         .unwrap_or_else(|_| engine.full_snapshot())
 }
+
+#[frb(sync)]
+pub fn engine_respond_clipboard_load(engine: &mut TerminalEngine, text: String) {
+    engine.respond_clipboard_load(text);
+}
+
+#[frb(sync)]
+pub fn engine_set_cell_pixels(engine: &mut TerminalEngine, width: u16, height: u16) {
+    engine.set_cell_pixels(width, height);
+}
