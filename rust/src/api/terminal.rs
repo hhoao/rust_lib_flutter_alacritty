@@ -149,3 +149,4 @@ pub fn engine_respond_clipboard_load(engine: &mut TerminalEngine, text: String) 
 pub fn engine_set_cell_pixels(engine: &mut TerminalEngine, width: u16, height: u16) {
     engine.set_cell_pixels(width, height);
 }
+

@@ -1145,6 +1145,17 @@ mod tests {
     }
 
     #[test]
+    fn semantic_escape_chars_affect_word_selection() {
+        let mut cfg = EngineConfig::defaults();
+        cfg.semantic_escape_chars = "-".to_string();
+        let mut e = TerminalEngine::new(20, 2, cfg);
+        e.advance(b"foo-bar".to_vec());
+        e.selection_start(0, 0, false, 1);
+        e.selection_update(0, 0, false);
+        assert_eq!(e.selection_text().as_deref(), Some("foo"));
+    }
+
+    #[test]
     fn palette_injection_overrides_ansi_colors() {
         let mut pal = EngineConfig::default_palette();
         pal[1] = 0x0011_2233;
