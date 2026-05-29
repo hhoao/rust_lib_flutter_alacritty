@@ -73,6 +73,11 @@ pub async fn engine_scroll_to_bottom(engine: &mut TerminalEngine) {
 }
 
 #[frb(sync)]
+pub fn engine_clear_history(engine: &mut TerminalEngine) {
+    engine.clear_history();
+}
+
+#[frb(sync)]
 pub fn engine_selection_start(
     engine: &mut TerminalEngine,
     display_row: i32,

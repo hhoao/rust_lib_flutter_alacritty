@@ -230,6 +230,11 @@ impl TerminalEngine {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    pub fn clear_history(&mut self) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        self.term.clear_screen(ClearMode::Saved);
+    }
+
     fn viewport_point(&self, display_row: i32, col: u16) -> Point {
         let d = self.term.grid().display_offset();
         viewport_to_point(d, Point::new(display_row.max(0) as usize, Column(col as usize)))
@@ -1225,6 +1230,19 @@ mod tests {
         let e = engine(10, 3);
         assert!(e.resolve_hyperlink(0).is_none());
         assert!(e.resolve_hyperlink(999).is_none());
+    }
+
+    #[test]
+    fn clear_history_drops_scrollback() {
+        let mut e = TerminalEngine::new(10, 2, EngineConfig::defaults());
+        // produce > screen_lines of output so there is scrollback
+        e.advance(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n".to_vec());
+        e.scroll_lines(100); // scroll up into history
+        let before = e.full_snapshot().display_offset;
+        e.clear_history();
+        let after = e.full_snapshot().display_offset;
+        assert_eq!(after, 0);
+        assert!(before >= after);
     }
 
     #[test]
