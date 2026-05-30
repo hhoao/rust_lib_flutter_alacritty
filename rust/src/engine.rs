@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::event_proxy::{
     ClipboardReplyQueue, EngineEvent, EventProxy, EventQueue, ReplyQueue, SizeReplyQueue,
 };
+use crate::osc_preparse::extract_osc_events;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -284,7 +285,11 @@ impl TerminalEngine {
     }
 
     pub fn advance(&mut self, bytes: Vec<u8>) {
-        self.parser.advance(&mut self.term, &bytes);
+        let (filtered, osc_events) = extract_osc_events(&bytes);
+        for e in osc_events {
+            self.events.lock().unwrap().push(e);
+        }
+        self.parser.advance(&mut self.term, &filtered);
         self.resolve_pending_replies();
     }
 

@@ -42,6 +42,10 @@ pub enum EngineEvent {
     Bell,
     ClipboardStore(String),
     ClipboardLoad,
+    /// OSC 7: current working directory (file://host/path).
+    WorkingDir(String),
+    /// OSC 9 / OSC 777: desktop notification (body, or "title\0body" for 777).
+    Notify(String),
 }
 
 /// Shared, thread-safe event queue owned by the engine and filled by the proxy.

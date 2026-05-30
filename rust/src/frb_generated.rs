@@ -1451,6 +1451,14 @@ impl SseDecode for crate::event_proxy::EngineEvent {
             5 => {
                 return crate::event_proxy::EngineEvent::ClipboardLoad;
             }
+            6 => {
+                let mut var_field0 = <String>::sse_decode(deserializer);
+                return crate::event_proxy::EngineEvent::WorkingDir(var_field0);
+            }
+            7 => {
+                let mut var_field0 = <String>::sse_decode(deserializer);
+                return crate::event_proxy::EngineEvent::Notify(var_field0);
+            }
             _ => {
                 unimplemented!("");
             }
@@ -1759,6 +1767,12 @@ impl flutter_rust_bridge::IntoDart for crate::event_proxy::EngineEvent {
                 [4.into_dart(), field0.into_into_dart().into_dart()].into_dart()
             }
             crate::event_proxy::EngineEvent::ClipboardLoad => [5.into_dart()].into_dart(),
+            crate::event_proxy::EngineEvent::WorkingDir(field0) => {
+                [6.into_dart(), field0.into_into_dart().into_dart()].into_dart()
+            }
+            crate::event_proxy::EngineEvent::Notify(field0) => {
+                [7.into_dart(), field0.into_into_dart().into_dart()].into_dart()
+            }
             _ => {
                 unimplemented!("");
             }
@@ -1900,6 +1914,14 @@ impl SseEncode for crate::event_proxy::EngineEvent {
             }
             crate::event_proxy::EngineEvent::ClipboardLoad => {
                 <i32>::sse_encode(5, serializer);
+            }
+            crate::event_proxy::EngineEvent::WorkingDir(field0) => {
+                <i32>::sse_encode(6, serializer);
+                <String>::sse_encode(field0, serializer);
+            }
+            crate::event_proxy::EngineEvent::Notify(field0) => {
+                <i32>::sse_encode(7, serializer);
+                <String>::sse_encode(field0, serializer);
             }
             _ => {
                 unimplemented!("");
