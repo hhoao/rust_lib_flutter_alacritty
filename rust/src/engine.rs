@@ -43,6 +43,12 @@ pub struct RenderUpdate {
     pub default_fg: u32,
     pub default_bg: u32,
     pub cursor_color: u32,
+    /// Sub-cell scroll position in [0.0, 1.0): how far, in fractions of a cell
+    /// height, the viewport is scrolled up past `display_offset`. The painter
+    /// shifts content DOWN by `scroll_fraction * cell_height` and fills the
+    /// revealed top sliver with the overscan row (the last entry in `lines` on
+    /// a full update). 0.0 when sitting on a line boundary.
+    pub scroll_fraction: f64,
 }
 
 impl RenderUpdate {
@@ -133,6 +139,10 @@ pub const FLAG_HYPERLINK: u16 = 1 << 11;
 const DEFAULT_FG: u32 = 0x00D8_D8D8;
 const DEFAULT_BG: u32 = 0x0018_1818;
 
+/// Fallback cell height (px) used by `scroll_pixels` only before the host has
+/// reported real metrics via `set_cell_pixels` — a rough mid-range row height.
+const DEFAULT_CELL_HEIGHT_PX: f64 = 16.0;
+
 /// Sentinel `cursor_color` when no program has set OSC 12. Impossible as a
 /// real packed color (`pack` always yields `0x00RRGGBB`), so Dart can
 /// distinguish "unset → keep inverse-video cursor" from a real cursor color.
@@ -214,6 +224,9 @@ pub struct TerminalEngine {
     hyperlinks: Vec<String>,
     hyperlink_ids: HashMap<String, u32>,
     hint_regex: Option<RegexSearch>,
+    /// Sub-cell scroll accumulator in cell-height fractions, kept in [0.0, 1.0).
+    /// See [`RenderUpdate::scroll_fraction`].
+    scroll_fraction: f64,
 }
 
 impl TerminalEngine {
@@ -260,6 +273,7 @@ impl TerminalEngine {
             hyperlinks: Vec::new(),
             hyperlink_ids: HashMap::new(),
             hint_regex,
+            scroll_fraction: 0.0,
         }
     }
 
@@ -280,6 +294,11 @@ impl TerminalEngine {
     }
 
     pub fn set_cell_pixels(&mut self, w: u16, h: u16) {
+        // Cell height changes the meaning of a sub-cell fraction (font zoom /
+        // DPR change), so snap to a line boundary rather than carry a stale one.
+        if h != self.cell_h {
+            self.scroll_fraction = 0.0;
+        }
         self.cell_w = w;
         self.cell_h = h;
     }
@@ -294,6 +313,9 @@ impl TerminalEngine {
     }
 
     pub fn resize(&mut self, columns: u16, rows: u16) {
+        // Resize clamps display_offset; drop any sub-cell offset so the viewport
+        // lands flush on a line after a reflow.
+        self.scroll_fraction = 0.0;
         let size = alacritty_terminal::term::test::TermSize::new(
             columns as usize,
             rows as usize,
@@ -302,10 +324,63 @@ impl TerminalEngine {
     }
 
     pub fn scroll_lines(&mut self, delta: i32) {
+        // Discrete scrolls (keyboard, wheel notches without pixel deltas) snap to
+        // a line boundary — drop any accumulated sub-cell offset.
+        self.scroll_fraction = 0.0;
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
+    /// Scroll by a pixel delta with sub-cell precision. Positive `delta_px`
+    /// scrolls UP into history (increasing `display_offset`); negative scrolls
+    /// back down toward the live edge. The fractional remainder is kept in
+    /// `scroll_fraction` ∈ [0.0, 1.0) and the line-level `display_offset` is
+    /// stepped whenever the accumulator crosses a cell boundary.
+    pub fn scroll_pixels(&mut self, delta_px: f64) {
+        if self.cell_h == 0 {
+            // Cell height not reported yet (set_cell_pixels pending) — degrade to
+            // a rounded line scroll so input is never dropped on the first frames.
+            let lines = (delta_px / DEFAULT_CELL_HEIGHT_PX).round() as i32;
+            if lines != 0 {
+                self.scroll_lines(lines);
+            }
+            return;
+        }
+        self.scroll_fraction += delta_px / self.cell_h as f64;
+        // Step display_offset one line at a time as the accumulator crosses each
+        // cell boundary. Break (and snap the fraction flush) if we hit a
+        // scrollback bound so the content never floats off a hard edge.
+        while self.scroll_fraction >= 1.0 {
+            let before = self.term.grid().display_offset();
+            self.term.scroll_display(Scroll::Delta(1));
+            if self.term.grid().display_offset() == before {
+                self.scroll_fraction = 0.0;
+                return;
+            }
+            self.scroll_fraction -= 1.0;
+        }
+        while self.scroll_fraction < 0.0 {
+            let before = self.term.grid().display_offset();
+            self.term.scroll_display(Scroll::Delta(-1));
+            if self.term.grid().display_offset() == before {
+                self.scroll_fraction = 0.0;
+                return;
+            }
+            self.scroll_fraction += 1.0;
+        }
+        // At the very top of history there is no line above the viewport to
+        // reveal. A leftover sub-line fraction there would shift content down
+        // over a blank sliver and — under a fling feeding repeated sub-line
+        // deltas — oscillate (build toward 1.0, snap to 0, repeat), which reads
+        // as jitter. Pin it flush.
+        if self.scroll_fraction > 0.0
+            && self.term.grid().display_offset() >= self.term.grid().history_size()
+        {
+            self.scroll_fraction = 0.0;
+        }
+    }
+
     pub fn scroll_to_bottom(&mut self) {
+        self.scroll_fraction = 0.0;
         self.term.scroll_display(Scroll::Bottom);
     }
 
@@ -496,6 +571,11 @@ impl TerminalEngine {
             for (m, uri) in matches.iter().zip(uris_for_matches.into_iter()) {
                 let id = self.intern_hyperlink(&uri);
                 for line in update.lines.iter_mut() {
+                    // Skip the trailing overscan row (sentinel index == rows); it
+                    // is not a viewport line and must not be hint-mapped.
+                    if line.line as usize >= rows {
+                        continue;
+                    }
                     for col in 0..line.cells.len() {
                         if line.cells[col].flags & FLAG_HYPERLINK != 0 {
                             continue;
@@ -718,7 +798,11 @@ impl TerminalEngine {
             flags: 0,
             hyperlink_id: 0,
         };
-        let mut lines: Vec<LineUpdate> = (0..rows)
+        // One extra trailing row (`lines[rows]`) holds the overscan line that sits
+        // just ABOVE the viewport top — the painter draws it in the sliver revealed
+        // when `scroll_fraction > 0`. It carries the sentinel line index `rows` so
+        // the hint pass skips it and the Dart side strips it off the viewport.
+        let mut lines: Vec<LineUpdate> = (0..rows + 1)
             .map(|r| LineUpdate {
                 line: r as u32,
                 cells: vec![blank.clone(); cols],
@@ -750,6 +834,26 @@ impl TerminalEngine {
                 }
             }
             lines[vline].cells[vcol] = cd;
+        }
+        // Overscan row: the line directly above the viewport top, i.e. grid
+        // `Line(-display_offset - 1)`. Present only when scrollback exists above
+        // the current view (`display_offset < history_size`); otherwise the slot
+        // stays blank (we're at the top of history, nothing to reveal).
+        if (display_offset as usize) < self.term.grid().history_size() {
+            let over_line = Line(-(display_offset as i32) - 1);
+            let over_cells: Vec<Cell> = {
+                let grid = self.term.grid();
+                (0..cols).map(|c| grid[over_line][Column(c)].clone()).collect()
+            };
+            for (col, cell) in over_cells.into_iter().enumerate() {
+                let mut cd = self.cell_data(&cell);
+                if let Some(ref r) = sel {
+                    if point_in_range(Point::new(over_line, Column(col)), r) {
+                        cd.flags |= FLAG_SELECTED;
+                    }
+                }
+                lines[rows].cells[col] = cd;
+            }
         }
         // Selection is computed per-cell, but a wide (CJK) glyph spans two cells:
         // the WIDE lead cell and its trailing WIDE_SPACER. Without binding them,
@@ -789,11 +893,15 @@ impl TerminalEngine {
             default_fg,
             default_bg,
             cursor_color,
+            scroll_fraction: self.scroll_fraction,
         }
     }
 
     pub fn take_damage(&mut self) -> RenderUpdate {
-        if self.term.grid().display_offset() > 0 {
+        // A non-zero sub-cell offset must ride on a full snapshot so the overscan
+        // row and `scroll_fraction` are present. Partial damage (which ships only
+        // changed viewport rows) is therefore limited to the flush, live-edge case.
+        if self.term.grid().display_offset() > 0 || self.scroll_fraction != 0.0 {
             let mut u = self.full_snapshot();
             self.apply_hint_pass(&mut u);
             return u;
@@ -841,6 +949,7 @@ impl TerminalEngine {
                     default_fg,
                     default_bg,
                     cursor_color,
+                    scroll_fraction: 0.0,
                 }
             }
         };
@@ -939,7 +1048,8 @@ mod tests {
         e.advance(b"hi".to_vec());
         let u = e.full_snapshot();
         assert_eq!(u.columns(), 20);
-        assert_eq!(u.lines.len(), 5);
+        // screen_lines (5) viewport rows + 1 trailing overscan row.
+        assert_eq!(u.lines.len(), 6);
         assert_eq!(ch(&u, 0, 0), 'h');
         assert_eq!(ch(&u, 0, 1), 'i');
         assert!(u.full);
@@ -970,7 +1080,7 @@ mod tests {
         e.resize(40, 10);
         let u = e.full_snapshot();
         assert_eq!(u.columns(), 40);
-        assert_eq!(u.lines.len(), 10);
+        assert_eq!(u.lines.len(), 11); // 10 viewport + 1 overscan
         assert_eq!(line(&u, 0).cells.len(), 40);
     }
 
@@ -1007,7 +1117,7 @@ mod tests {
         e.resize(30, 6);
         let u = e.take_damage();
         assert!(u.full);
-        assert_eq!(u.lines.len(), 6);
+        assert_eq!(u.lines.len(), 7); // 6 viewport + 1 overscan
     }
 
     #[test]
@@ -1427,5 +1537,181 @@ mod tests {
                 if String::from_utf8_lossy(b).contains("4;432;720t"))
         });
         assert!(ok, "got {evs:?}");
+    }
+
+    // ---- sub-cell pixel scroll ------------------------------------------
+
+    /// Print `n` numbered lines so a small screen accrues scrollback history.
+    fn fill_lines(e: &mut TerminalEngine, n: usize) {
+        for i in 0..n {
+            e.advance(format!("line{i:02}\r\n").into_bytes());
+        }
+    }
+
+    #[test]
+    fn scroll_pixels_accumulates_fraction_then_steps_a_line() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+
+        // Half a cell up: stays on the same line, fraction = 0.5.
+        e.scroll_pixels(9.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 0);
+        assert!((u.scroll_fraction - 0.5).abs() < 1e-9);
+
+        // Another half: wraps to the next history line, fraction back to 0.
+        e.scroll_pixels(9.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 1);
+        assert!(u.scroll_fraction.abs() < 1e-9);
+
+        // Reverse half a cell: steps back down, fraction = 0.5 again.
+        e.scroll_pixels(-9.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 0);
+        assert!((u.scroll_fraction - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_pixels_large_delta_steps_multiple_lines() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 20);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(3.5 * 18.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 3);
+        assert!((u.scroll_fraction - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_pixels_zero_delta_is_noop() {
+        let mut e = engine(10, 3);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(0.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 0);
+        assert_eq!(u.scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn scroll_pixels_without_cell_pixels_falls_back_to_line_scroll() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.scroll_pixels(2.0 * DEFAULT_CELL_HEIGHT_PX);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 2);
+        assert_eq!(u.scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn scroll_pixels_snaps_flush_at_top_of_history() {
+        let mut e = engine(10, 2);
+        fill_lines(&mut e, 6);
+        e.set_cell_pixels(9, 18);
+        // Scroll far past the top; offset clamps and the fraction snaps to 0.
+        e.scroll_pixels(1000.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset as usize, e.term.grid().history_size());
+        assert_eq!(u.scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn scroll_pixels_sub_line_at_top_keeps_fraction_pinned() {
+        // Regression: at the very top, sub-line up-scrolls (e.g. a decaying fling)
+        // must not accumulate a fraction — that caused build-to-1/snap jitter.
+        let mut e = engine(10, 2);
+        fill_lines(&mut e, 5);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(1000.0); // pin to the top
+        assert_eq!(e.full_snapshot().display_offset as usize, e.term.grid().history_size());
+        for _ in 0..5 {
+            e.scroll_pixels(9.0); // half a cell up, repeatedly
+            assert_eq!(e.full_snapshot().scroll_fraction, 0.0);
+        }
+    }
+
+    #[test]
+    fn scroll_pixels_snaps_flush_at_live_bottom() {
+        let mut e = engine(10, 2);
+        fill_lines(&mut e, 6);
+        e.set_cell_pixels(9, 18);
+        // Already at the bottom; scrolling further down cannot move and snaps flush.
+        e.scroll_pixels(-1000.0);
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 0);
+        assert_eq!(u.scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn full_snapshot_overscan_row_is_line_above_viewport() {
+        // 2-row screen, four logical lines: viewport shows CCCC/DDDD at offset 0,
+        // so the overscan row (last entry) must be the line just above: BBBB.
+        let mut e = engine(10, 2);
+        e.advance(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD".to_vec());
+        let u = e.full_snapshot();
+        assert_eq!(u.lines.len(), 3); // 2 viewport + 1 overscan
+        assert_eq!(ch(&u, 0, 0), 'C');
+        assert_eq!(ch(&u, 1, 0), 'D');
+        // Overscan carries sentinel line index == screen_lines.
+        assert_eq!(ch(&u, 2, 0), 'B');
+    }
+
+    #[test]
+    fn full_snapshot_overscan_blank_at_top_of_history() {
+        // No scrollback above the viewport → overscan row left blank.
+        let mut e = engine(10, 3);
+        e.advance(b"hi".to_vec());
+        let u = e.full_snapshot();
+        assert_eq!(u.lines.len(), 4);
+        assert_eq!(ch(&u, 3, 0), ' ');
+    }
+
+    #[test]
+    fn take_damage_forces_full_when_fraction_nonzero() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+        e.take_damage(); // drain
+        e.scroll_pixels(9.0); // fraction 0.5, still display_offset 0
+        let u = e.take_damage();
+        assert!(u.full, "non-zero fraction must ride a full snapshot");
+        assert!((u.scroll_fraction - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_clears_scroll_fraction() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(9.0); // fraction 0.5
+        e.resize(12, 4);
+        assert_eq!(e.full_snapshot().scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn cell_height_change_clears_scroll_fraction() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(9.0); // fraction 0.5
+        e.set_cell_pixels(9, 20); // zoom: cell height changed
+        assert_eq!(e.full_snapshot().scroll_fraction, 0.0);
+        // Same height again must NOT reset a live fraction.
+        e.scroll_pixels(10.0); // 0.5 at h=20
+        e.set_cell_pixels(9, 20);
+        assert!((e.full_snapshot().scroll_fraction - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_to_bottom_clears_fraction() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(9.0);
+        e.scroll_to_bottom();
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 0);
+        assert_eq!(u.scroll_fraction, 0.0);
     }
 }

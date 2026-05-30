@@ -32,6 +32,7 @@ pub async fn engine_take_damage(engine: &mut TerminalEngine) -> RenderUpdate {
             default_fg: crate::engine::EngineConfig::default_palette()[16],
             default_bg: crate::engine::EngineConfig::default_palette()[17],
             cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+            scroll_fraction: 0.0,
         }
     })
 }
@@ -66,6 +67,11 @@ pub fn engine_resize(engine: &mut TerminalEngine, columns: u16, rows: u16) {
 
 pub async fn engine_scroll_lines(engine: &mut TerminalEngine, delta: i32) {
     engine.scroll_lines(delta);
+}
+
+/// Sub-cell pixel scroll. Positive `delta_px` scrolls up into history.
+pub async fn engine_scroll_pixels(engine: &mut TerminalEngine, delta_px: f64) {
+    engine.scroll_pixels(delta_px);
 }
 
 pub async fn engine_scroll_to_bottom(engine: &mut TerminalEngine) {
