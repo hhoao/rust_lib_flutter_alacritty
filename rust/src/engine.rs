@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::csi_mode_scan::{ColorSchemeToggle, CsiModeScanner};
 use crate::event_proxy::{
     ClipboardReplyQueue, EngineEvent, EventProxy, EventQueue, ReplyQueue, SizeReplyQueue,
 };
@@ -156,6 +157,15 @@ fn unpack(v: u32) -> Rgb {
     Rgb { r: (v >> 16) as u8, g: (v >> 8) as u8, b: v as u8 }
 }
 
+/// Whether a packed `0x00RRGGBB` background reads as "dark" — used to pick the
+/// OSC 997 color-scheme report value. Rec. 709 relative luminance, midpoint 128.
+fn is_dark_bg(packed: u32) -> bool {
+    let r = ((packed >> 16) & 0xFF) as f64;
+    let g = ((packed >> 8) & 0xFF) as f64;
+    let b = (packed & 0xFF) as f64;
+    0.2126 * r + 0.7152 * g + 0.0722 * b < 128.0
+}
+
 fn map_flags(f: Flags) -> u16 {
     let mut out = 0u16;
     if f.contains(Flags::BOLD) {
@@ -227,6 +237,13 @@ pub struct TerminalEngine {
     /// Sub-cell scroll accumulator in cell-height fractions, kept in [0.0, 1.0).
     /// See [`RenderUpdate::scroll_fraction`].
     scroll_fraction: f64,
+    /// Parallel sniffer for DEC private mode 2031 (color-scheme notifications),
+    /// which the pinned alacritty parser doesn't surface. See [`CsiModeScanner`].
+    color_scheme_scanner: CsiModeScanner,
+    /// Whether the running program subscribed (mode 2031) to color-scheme
+    /// change notifications. When set, [`reconfigure`](Self::reconfigure) pushes
+    /// an OSC 997 report so a live theme toggle re-themes the TUI without a restart.
+    color_scheme_subscribed: bool,
 }
 
 impl TerminalEngine {
@@ -274,6 +291,8 @@ impl TerminalEngine {
             hyperlink_ids: HashMap::new(),
             hint_regex,
             scroll_fraction: 0.0,
+            color_scheme_scanner: CsiModeScanner::new(),
+            color_scheme_subscribed: false,
         }
     }
 
@@ -304,12 +323,40 @@ impl TerminalEngine {
     }
 
     pub fn advance(&mut self, bytes: Vec<u8>) {
+        // Sniff mode-2031 toggles from the raw stream (alacritty hides them). Use
+        // the original bytes — OSC pre-filtering can splice the stream, but it
+        // only touches `ESC ]` sequences, never the `ESC [` CSI we look for.
+        let toggles = self.color_scheme_scanner.feed(&bytes);
         let (filtered, osc_events) = extract_osc_events(&bytes);
         for e in osc_events {
             self.events.lock().unwrap().push(e);
         }
         self.parser.advance(&mut self.term, &filtered);
         self.resolve_pending_replies();
+        for toggle in toggles {
+            match toggle {
+                ColorSchemeToggle::Subscribe => {
+                    self.color_scheme_subscribed = true;
+                    // Per the protocol, answer the subscribe with the current scheme.
+                    self.emit_color_scheme_report();
+                }
+                ColorSchemeToggle::Unsubscribe => self.color_scheme_subscribed = false,
+            }
+        }
+    }
+
+    /// Push an OSC 997 color-scheme report (`1` = dark, `2` = light) onto the
+    /// PTY write queue, derived from the live default background's luminance.
+    fn emit_color_scheme_report(&self) {
+        let report: &[u8] = if is_dark_bg(self.palette[17]) {
+            b"\x1b]997;1\x1b\\"
+        } else {
+            b"\x1b]997;2\x1b\\"
+        };
+        self.events
+            .lock()
+            .unwrap()
+            .push(EngineEvent::PtyWrite(report.to_vec()));
     }
 
     pub fn resize(&mut self, columns: u16, rows: u16) {
@@ -399,6 +446,12 @@ impl TerminalEngine {
         self.set_palette(config.palette.clone());
         let term_config = build_term_config(&config);
         self.term.set_options(term_config);
+        // A reconfigure carries the new themed palette; if the program asked for
+        // color-scheme notifications (mode 2031), tell it about the new light/dark
+        // so a live app-theme toggle re-themes the running TUI without a restart.
+        if self.color_scheme_subscribed {
+            self.emit_color_scheme_report();
+        }
     }
 
     fn viewport_point(&self, display_row: i32, col: u16) -> Point {
@@ -1040,6 +1093,54 @@ mod tests {
         let mut e = engine(10, 3);
         e.advance(b"\x1b]12;?\x1b\\".to_vec()); // query cursor color, never set
         assert!(pty_writes(&e).is_empty(), "unset cursor query is dropped (alacritty parity)");
+    }
+
+    /// EngineConfig whose default background is `bg` (packed RGB); rest defaults.
+    fn config_with_bg(bg: u32) -> EngineConfig {
+        let mut palette = EngineConfig::default_palette().to_vec();
+        palette[17] = bg;
+        EngineConfig {
+            palette,
+            ..EngineConfig::defaults()
+        }
+    }
+
+    const COLOR_SCHEME_DARK: &[u8] = b"\x1b]997;1\x1b\\";
+    const COLOR_SCHEME_LIGHT: &[u8] = b"\x1b]997;2\x1b\\";
+
+    #[test]
+    fn mode2031_subscribe_reports_current_scheme() {
+        // Default config bg (0x181818) is dark → report "1".
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b[?2031h".to_vec());
+        assert_eq!(pty_writes(&e), vec![COLOR_SCHEME_DARK.to_vec()]);
+    }
+
+    #[test]
+    fn mode2031_reconfigure_pushes_update_when_subscribed() {
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b[?2031h".to_vec());
+        let _ = e.take_events(); // drain the subscribe report
+        // Switch to a light themed palette: the running TUI must be told.
+        e.reconfigure(config_with_bg(0x00FF_FFFF));
+        assert_eq!(pty_writes(&e), vec![COLOR_SCHEME_LIGHT.to_vec()]);
+    }
+
+    #[test]
+    fn mode2031_reconfigure_silent_when_not_subscribed() {
+        let mut e = engine(10, 3);
+        e.reconfigure(config_with_bg(0x00FF_FFFF));
+        assert!(pty_writes(&e).is_empty(), "no report without a subscriber");
+    }
+
+    #[test]
+    fn mode2031_unsubscribe_stops_updates() {
+        let mut e = engine(10, 3);
+        e.advance(b"\x1b[?2031h".to_vec());
+        e.advance(b"\x1b[?2031l".to_vec());
+        let _ = e.take_events();
+        e.reconfigure(config_with_bg(0x00FF_FFFF));
+        assert!(pty_writes(&e).is_empty(), "unsubscribed program gets no updates");
     }
 
     #[test]
