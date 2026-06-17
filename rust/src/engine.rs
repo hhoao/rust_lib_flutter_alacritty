@@ -14,6 +14,28 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
+/// Smallest grid the VT model can actually represent.
+///
+/// `Term::input` writes a fullwidth glyph and then unconditionally advances the
+/// cursor one cell to write its trailing spacer (term/mod.rs). With a single
+/// column that advance lands past the row end and `Grid::cursor_cell` panics
+/// (`index out of bounds: the len is 1 but the index is 1`). A terminal must
+/// therefore hold at least one fullwidth cell plus its spacer — alacritty's own
+/// window layer enforces the same floor. We pin it at the one boundary where an
+/// external `(columns, rows)` becomes a `TermSize`, so no caller (Dart, view
+/// layout, tests) can ever construct a degenerate grid.
+const MIN_COLUMNS: usize = 2;
+const MIN_SCREEN_LINES: usize = 1;
+
+/// The only place a `(columns, rows)` pair is turned into grid geometry. Clamps
+/// to the VT minimum so an invalid grid size is unrepresentable past this point.
+fn clamped_term_size(columns: u16, rows: u16) -> alacritty_terminal::term::test::TermSize {
+    alacritty_terminal::term::test::TermSize::new(
+        (columns as usize).max(MIN_COLUMNS),
+        (rows as usize).max(MIN_SCREEN_LINES),
+    )
+}
+
 /// Flat, FFI-friendly cell. fg/bg are packed 0x00RRGGBB.
 #[derive(Clone, Debug)]
 pub struct CellData {
@@ -233,7 +255,6 @@ pub struct TerminalEngine {
     current_match: Option<Match>,
     hyperlinks: Vec<String>,
     hyperlink_ids: HashMap<String, u32>,
-    hint_regex: Option<RegexSearch>,
     /// Sub-cell scroll accumulator in cell-height fractions, kept in [0.0, 1.0).
     /// See [`RenderUpdate::scroll_fraction`].
     scroll_fraction: f64,
@@ -248,10 +269,7 @@ pub struct TerminalEngine {
 
 impl TerminalEngine {
     pub fn new(columns: u16, rows: u16, config: EngineConfig) -> TerminalEngine {
-        let size = alacritty_terminal::term::test::TermSize::new(
-            columns as usize,
-            rows as usize,
-        );
+        let size = clamped_term_size(columns, rows);
         let term_config = build_term_config(&config);
         // Length-guard: Dart always sends 18; fall back defensively if not.
         let palette: [u32; 18] = config
@@ -274,7 +292,6 @@ impl TerminalEngine {
         );
         // Term boots with `damage.full`; clear so the first `take_damage` after input is partial.
         term.reset_damage();
-        let hint_regex = RegexSearch::new(r"(?:https?|ftp|file)://[^\s]+").ok();
         TerminalEngine {
             term,
             parser: Processor::new(),
@@ -289,7 +306,6 @@ impl TerminalEngine {
             current_match: None,
             hyperlinks: Vec::new(),
             hyperlink_ids: HashMap::new(),
-            hint_regex,
             scroll_fraction: 0.0,
             color_scheme_scanner: CsiModeScanner::new(),
             color_scheme_subscribed: false,
@@ -363,10 +379,7 @@ impl TerminalEngine {
         // Resize clamps display_offset; drop any sub-cell offset so the viewport
         // lands flush on a line after a reflow.
         self.scroll_fraction = 0.0;
-        let size = alacritty_terminal::term::test::TermSize::new(
-            columns as usize,
-            rows as usize,
-        );
+        let size = clamped_term_size(columns, rows);
         self.term.resize(size);
     }
 
@@ -584,67 +597,7 @@ impl TerminalEngine {
             }
         }
 
-        self.apply_hint_pass(&mut update);
         update
-    }
-
-    /// URL auto-detect over the visible region; skips cells already hyperlinked (OSC 8).
-    fn apply_hint_pass(&mut self, update: &mut RenderUpdate) {
-        if let Some(hint) = self.hint_regex.as_mut() {
-            let off = self.term.grid().display_offset();
-            let rows = self.term.screen_lines();
-            let cols = self.term.columns();
-            let top = viewport_to_point(off, Point::new(0, Column(0)));
-            let bottom = viewport_to_point(off, Point::new(rows - 1, Column(cols - 1)));
-            let matches: Vec<Match> =
-                RegexIter::new(top, bottom, Direction::Right, &self.term, hint).collect();
-            let uris_for_matches: Vec<String> = matches
-                .iter()
-                .map(|m| {
-                    let mut s = String::new();
-                    let grid = self.term.grid();
-                    let (start, end) = (m.start(), m.end());
-                    let mut line = start.line;
-                    while line <= end.line {
-                        let col_start =
-                            if line == start.line { start.column.0 } else { 0 };
-                        let col_end = if line == end.line {
-                            end.column.0
-                        } else {
-                            grid.columns() - 1
-                        };
-                        for c in col_start..=col_end {
-                            s.push(grid[line][Column(c)].c);
-                        }
-                        line = Line(line.0 + 1);
-                    }
-                    s
-                })
-                .collect();
-            for (m, uri) in matches.iter().zip(uris_for_matches.into_iter()) {
-                let id = self.intern_hyperlink(&uri);
-                for line in update.lines.iter_mut() {
-                    // Skip the trailing overscan row (sentinel index == rows); it
-                    // is not a viewport line and must not be hint-mapped.
-                    if line.line as usize >= rows {
-                        continue;
-                    }
-                    for col in 0..line.cells.len() {
-                        if line.cells[col].flags & FLAG_HYPERLINK != 0 {
-                            continue;
-                        }
-                        let p = viewport_to_point(
-                            off,
-                            Point::new(line.line as usize, Column(col)),
-                        );
-                        if point_in_match(p, m) {
-                            line.cells[col].flags |= FLAG_HYPERLINK;
-                            line.cells[col].hyperlink_id = id;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Cells of a single viewport row.
@@ -955,9 +908,7 @@ impl TerminalEngine {
         // row and `scroll_fraction` are present. Partial damage (which ships only
         // changed viewport rows) is therefore limited to the flush, live-edge case.
         if self.term.grid().display_offset() > 0 || self.scroll_fraction != 0.0 {
-            let mut u = self.full_snapshot();
-            self.apply_hint_pass(&mut u);
-            return u;
+            return self.full_snapshot();
         }
         // Collect damaged viewport rows, then drop the borrow before reading cells.
         let damaged: Option<Vec<usize>> = match self.term.damage() {
@@ -968,7 +919,7 @@ impl TerminalEngine {
 
         let (cursor_line, cursor_col, cursor_visible, cursor_shape, cursor_blinking) =
             self.cursor_fields();
-        let mut u = match damaged {
+        let u = match damaged {
             None => {
                 let mut u = self.full_snapshot();
                 u.cursor_line = cursor_line;
@@ -1006,7 +957,6 @@ impl TerminalEngine {
                 }
             }
         };
-        self.apply_hint_pass(&mut u);
         u
     }
 }
@@ -1045,6 +995,23 @@ mod tests {
         assert_eq!(u.default_bg, 0x00FF_0000, "chrome default_bg follows OSC 11");
         // A blank cell (no explicit bg) must repack to the live default bg.
         assert_eq!(line(&u, 0).cells[0].bg, 0x00FF_0000, "blank cell uses live bg");
+    }
+
+    #[test]
+    fn degenerate_size_clamps_to_vt_minimum_and_never_panics() {
+        // Regression: a 1-column grid panics `cursor_cell` when `Term::input`
+        // writes a fullwidth glyph's trailing spacer past the row end. Both the
+        // constructor and resize must clamp to the VT minimum at the boundary.
+        let mut e = engine(1, 1);
+        assert!(e.term.columns() >= MIN_COLUMNS, "new() clamps columns");
+        assert!(e.term.screen_lines() >= MIN_SCREEN_LINES, "new() clamps rows");
+        // Fullwidth (CJK) + ASCII into the formerly-degenerate grid: no panic.
+        e.advance("界A".as_bytes().to_vec());
+
+        // A live resize down to one column must clamp too, then tolerate output.
+        e.resize(1, 1);
+        assert!(e.term.columns() >= MIN_COLUMNS, "resize() clamps columns");
+        e.advance("界".as_bytes().to_vec());
     }
 
     #[test]
@@ -1545,31 +1512,6 @@ mod tests {
     }
 
     #[test]
-    fn url_auto_detect_marks_visible_region() {
-        let mut e = engine(40, 3);
-        e.advance(b"see https://x.io/p next".to_vec());
-        let u = e.full_snapshot_searched();
-        let cell = &u.lines[0].cells[4];
-        assert_ne!(cell.flags & FLAG_HYPERLINK, 0);
-        assert_ne!(cell.hyperlink_id, 0);
-        let uri = e.resolve_hyperlink(cell.hyperlink_id).unwrap();
-        assert!(uri.starts_with("https://x.io/p"), "uri was {uri:?}");
-        assert_eq!(u.lines[0].cells[2].flags & FLAG_HYPERLINK, 0);
-    }
-
-    #[test]
-    fn url_auto_detect_applies_on_take_damage_path() {
-        let mut e = engine(40, 3);
-        e.take_damage(); // drain initial full damage
-        e.advance(b"see https://x.io/p next".to_vec());
-        let u = e.take_damage();
-        let row = u.lines.iter().find(|l| l.line == 0).expect("row 0");
-        let cell = &row.cells[4];
-        assert_ne!(cell.flags & FLAG_HYPERLINK, 0);
-        assert_ne!(cell.hyperlink_id, 0);
-    }
-
-    #[test]
     fn resolve_hyperlink_returns_none_for_unknown_id() {
         let e = engine(10, 3);
         assert!(e.resolve_hyperlink(0).is_none());
@@ -1590,16 +1532,20 @@ mod tests {
     }
 
     #[test]
-    fn osc8_wins_over_auto_detect_when_both_apply() {
+    fn plain_url_is_not_auto_marked_by_engine() {
+        // URL detection moved to the Dart UrlLinkProvider; the engine marks only
+        // OSC 8 hyperlinks. A bare URL with no OSC 8 must stay unmarked here.
         let mut e = engine(40, 3);
-        e.advance(
-            b"\x1b]8;;https://osc8.example\x1b\\https://other.example\x1b]8;;\x1b\\".to_vec(),
-        );
+        e.advance(b"see https://example.com here".to_vec());
         let u = e.full_snapshot_searched();
-        let cell = &u.lines[0].cells[0];
-        assert_eq!(
-            e.resolve_hyperlink(cell.hyperlink_id).as_deref(),
-            Some("https://osc8.example")
+        let any_hyperlink = u
+            .lines
+            .iter()
+            .flat_map(|l| l.cells.iter())
+            .any(|c| c.flags & FLAG_HYPERLINK != 0);
+        assert!(
+            !any_hyperlink,
+            "engine must not auto-mark plain URLs after hint-pass removal"
         );
     }
 
