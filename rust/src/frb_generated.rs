@@ -1451,24 +1451,6 @@ impl SseDecode for bool {
     }
 }
 
-impl SseDecode for crate::engine::CellData {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_codepoint = <u32>::sse_decode(deserializer);
-        let mut var_fg = <u32>::sse_decode(deserializer);
-        let mut var_bg = <u32>::sse_decode(deserializer);
-        let mut var_flags = <u16>::sse_decode(deserializer);
-        let mut var_hyperlinkId = <u32>::sse_decode(deserializer);
-        return crate::engine::CellData {
-            codepoint: var_codepoint,
-            fg: var_fg,
-            bg: var_bg,
-            flags: var_flags,
-            hyperlink_id: var_hyperlinkId,
-        };
-    }
-}
-
 impl SseDecode for crate::engine::EngineConfig {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1548,23 +1530,19 @@ impl SseDecode for crate::engine::LineUpdate {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut var_line = <u32>::sse_decode(deserializer);
-        let mut var_cells = <Vec<crate::engine::CellData>>::sse_decode(deserializer);
+        let mut var_codepoints = <Vec<u32>>::sse_decode(deserializer);
+        let mut var_fg = <Vec<u32>>::sse_decode(deserializer);
+        let mut var_bg = <Vec<u32>>::sse_decode(deserializer);
+        let mut var_flags = <Vec<u16>>::sse_decode(deserializer);
+        let mut var_hyperlinkId = <Vec<u32>>::sse_decode(deserializer);
         return crate::engine::LineUpdate {
             line: var_line,
-            cells: var_cells,
+            codepoints: var_codepoints,
+            fg: var_fg,
+            bg: var_bg,
+            flags: var_flags,
+            hyperlink_id: var_hyperlinkId,
         };
-    }
-}
-
-impl SseDecode for Vec<crate::engine::CellData> {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut len_ = <i32>::sse_decode(deserializer);
-        let mut ans_ = Vec::with_capacity(len_ as usize);
-        for idx_ in 0..len_ {
-            ans_.push(<crate::engine::CellData>::sse_decode(deserializer));
-        }
-        return ans_;
     }
 }
 
@@ -1587,6 +1565,18 @@ impl SseDecode for Vec<crate::engine::LineUpdate> {
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
             ans_.push(<crate::engine::LineUpdate>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<u16> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<u16>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -1787,25 +1777,6 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<TerminalEngine>> for TerminalE
 }
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::engine::CellData {
-    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
-        [
-            self.codepoint.into_into_dart().into_dart(),
-            self.fg.into_into_dart().into_dart(),
-            self.bg.into_into_dart().into_dart(),
-            self.flags.into_into_dart().into_dart(),
-            self.hyperlink_id.into_into_dart().into_dart(),
-        ]
-        .into_dart()
-    }
-}
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::engine::CellData {}
-impl flutter_rust_bridge::IntoIntoDart<crate::engine::CellData> for crate::engine::CellData {
-    fn into_into_dart(self) -> crate::engine::CellData {
-        self
-    }
-}
-// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::engine::EngineConfig {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -1871,7 +1842,11 @@ impl flutter_rust_bridge::IntoDart for crate::engine::LineUpdate {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
             self.line.into_into_dart().into_dart(),
-            self.cells.into_into_dart().into_dart(),
+            self.codepoints.into_into_dart().into_dart(),
+            self.fg.into_into_dart().into_dart(),
+            self.bg.into_into_dart().into_dart(),
+            self.flags.into_into_dart().into_dart(),
+            self.hyperlink_id.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1941,17 +1916,6 @@ impl SseEncode for bool {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         serializer.cursor.write_u8(self as _).unwrap();
-    }
-}
-
-impl SseEncode for crate::engine::CellData {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <u32>::sse_encode(self.codepoint, serializer);
-        <u32>::sse_encode(self.fg, serializer);
-        <u32>::sse_encode(self.bg, serializer);
-        <u16>::sse_encode(self.flags, serializer);
-        <u32>::sse_encode(self.hyperlink_id, serializer);
     }
 }
 
@@ -2025,17 +1989,11 @@ impl SseEncode for crate::engine::LineUpdate {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <u32>::sse_encode(self.line, serializer);
-        <Vec<crate::engine::CellData>>::sse_encode(self.cells, serializer);
-    }
-}
-
-impl SseEncode for Vec<crate::engine::CellData> {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <i32>::sse_encode(self.len() as _, serializer);
-        for item in self {
-            <crate::engine::CellData>::sse_encode(item, serializer);
-        }
+        <Vec<u32>>::sse_encode(self.codepoints, serializer);
+        <Vec<u32>>::sse_encode(self.fg, serializer);
+        <Vec<u32>>::sse_encode(self.bg, serializer);
+        <Vec<u16>>::sse_encode(self.flags, serializer);
+        <Vec<u32>>::sse_encode(self.hyperlink_id, serializer);
     }
 }
 
@@ -2055,6 +2013,16 @@ impl SseEncode for Vec<crate::engine::LineUpdate> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <crate::engine::LineUpdate>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<u16> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <u16>::sse_encode(item, serializer);
         }
     }
 }

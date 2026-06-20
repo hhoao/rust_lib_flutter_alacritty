@@ -46,10 +46,70 @@ pub struct CellData {
     pub hyperlink_id: u32,
 }
 
+/// Flat, columnar line for the FFI boundary. Storing each attribute in its own
+/// primitive vector lets flutter_rust_bridge decode them as Dart typed lists
+/// (`Uint32List` / `Uint16List`) in one shot — no per-cell Dart object is
+/// allocated, unlike a `Vec<CellData>` which materializes one object per column.
+/// Built internally from `Vec<CellData>` (which keeps the ergonomic per-cell
+/// engine logic) and packed only at the boundary via [`LineUpdate::from_cells`].
 #[derive(Clone, Debug)]
 pub struct LineUpdate {
     pub line: u32,
-    pub cells: Vec<CellData>,
+    pub codepoints: Vec<u32>,
+    pub fg: Vec<u32>,
+    pub bg: Vec<u32>,
+    pub flags: Vec<u16>,
+    pub hyperlink_id: Vec<u32>,
+}
+
+impl LineUpdate {
+    /// Packs a row of per-cell [`CellData`] into the columnar FFI layout.
+    fn from_cells(line: u32, cells: Vec<CellData>) -> LineUpdate {
+        let n = cells.len();
+        let mut codepoints = Vec::with_capacity(n);
+        let mut fg = Vec::with_capacity(n);
+        let mut bg = Vec::with_capacity(n);
+        let mut flags = Vec::with_capacity(n);
+        let mut hyperlink_id = Vec::with_capacity(n);
+        for c in cells {
+            codepoints.push(c.codepoint);
+            fg.push(c.fg);
+            bg.push(c.bg);
+            flags.push(c.flags);
+            hyperlink_id.push(c.hyperlink_id);
+        }
+        LineUpdate { line, codepoints, fg, bg, flags, hyperlink_id }
+    }
+
+    /// Column count of this line.
+    fn len(&self) -> usize {
+        self.codepoints.len()
+    }
+
+    /// Reconstructs a single cell from the columnar layout (test ergonomics).
+    #[cfg(test)]
+    fn cell(&self, col: usize) -> CellData {
+        CellData {
+            codepoint: self.codepoints[col],
+            fg: self.fg[col],
+            bg: self.bg[col],
+            flags: self.flags[col],
+            hyperlink_id: self.hyperlink_id[col],
+        }
+    }
+}
+
+/// Internal row being built before it is packed into a columnar [`LineUpdate`].
+/// Keeps `cells` so the snapshot/selection/wide-pair logic stays per-cell.
+struct RawLine {
+    line: u32,
+    cells: Vec<CellData>,
+}
+
+impl RawLine {
+    fn pack(self) -> LineUpdate {
+        LineUpdate::from_cells(self.line, self.cells)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -77,7 +137,7 @@ pub struct RenderUpdate {
 impl RenderUpdate {
     /// Column count inferred from the first line (test/diagnostic helper).
     pub fn columns(&self) -> usize {
-        self.lines.first().map(|l| l.cells.len()).unwrap_or(0)
+        self.lines.first().map(|l| l.len()).unwrap_or(0)
     }
 }
 
@@ -583,14 +643,14 @@ impl TerminalEngine {
             let matches: Vec<Match> =
                 RegexIter::new(top, bottom, Direction::Right, &self.term, re).collect();
             for line in update.lines.iter_mut() {
-                for col in 0..line.cells.len() {
+                for col in 0..line.len() {
                     let p = viewport_to_point(off, Point::new(line.line as usize, Column(col)));
                     if matches.iter().any(|m| point_in_match(p, m)) {
-                        line.cells[col].flags |= FLAG_MATCH;
+                        line.flags[col] |= FLAG_MATCH;
                     }
                     if let Some(m) = &current {
                         if point_in_match(p, m) {
-                            line.cells[col].flags |= FLAG_MATCH_CURRENT;
+                            line.flags[col] |= FLAG_MATCH_CURRENT;
                         }
                     }
                 }
@@ -808,8 +868,8 @@ impl TerminalEngine {
         // just ABOVE the viewport top — the painter draws it in the sliver revealed
         // when `scroll_fraction > 0`. It carries the sentinel line index `rows` so
         // the hint pass skips it and the Dart side strips it off the viewport.
-        let mut lines: Vec<LineUpdate> = (0..rows + 1)
-            .map(|r| LineUpdate {
+        let mut lines: Vec<RawLine> = (0..rows + 1)
+            .map(|r| RawLine {
                 line: r as u32,
                 cells: vec![blank.clone(); cols],
             })
@@ -887,7 +947,7 @@ impl TerminalEngine {
             self.cursor_fields();
         let (default_fg, default_bg, cursor_color) = self.chrome_colors();
         RenderUpdate {
-            lines,
+            lines: lines.into_iter().map(RawLine::pack).collect(),
             full: true,
             cursor_line,
             cursor_col,
@@ -934,10 +994,7 @@ impl TerminalEngine {
                 rows.dedup();
                 let lines = rows
                     .into_iter()
-                    .map(|row| LineUpdate {
-                        line: row as u32,
-                        cells: self.line_cells(row),
-                    })
+                    .map(|row| LineUpdate::from_cells(row as u32, self.line_cells(row)))
                     .collect();
                 let (default_fg, default_bg, cursor_color) = self.chrome_colors();
                 RenderUpdate {
@@ -973,7 +1030,7 @@ mod tests {
         u.lines.iter().find(|l| l.line == row).expect("line present")
     }
     fn ch(u: &RenderUpdate, row: u32, col: usize) -> char {
-        char::from_u32(line(u, row).cells[col].codepoint).unwrap()
+        char::from_u32(line(u, row).cell(col).codepoint).unwrap()
     }
 
     fn pty_writes(e: &TerminalEngine) -> Vec<Vec<u8>> {
@@ -994,7 +1051,7 @@ mod tests {
         let u = e.full_snapshot();
         assert_eq!(u.default_bg, 0x00FF_0000, "chrome default_bg follows OSC 11");
         // A blank cell (no explicit bg) must repack to the live default bg.
-        assert_eq!(line(&u, 0).cells[0].bg, 0x00FF_0000, "blank cell uses live bg");
+        assert_eq!(line(&u, 0).cell(0).bg, 0x00FF_0000, "blank cell uses live bg");
     }
 
     #[test]
@@ -1128,7 +1185,7 @@ mod tests {
         let mut e = engine(20, 5);
         e.advance(b"\x1b[31mR".to_vec());
         let u = e.full_snapshot();
-        let c = &line(&u, 0).cells[0];
+        let c = &line(&u, 0).cell(0);
         assert_eq!(char::from_u32(c.codepoint).unwrap(), 'R');
         assert_eq!(c.fg & 0x00FF_FFFF, 0x00CC_0000);
     }
@@ -1149,7 +1206,7 @@ mod tests {
         let u = e.full_snapshot();
         assert_eq!(u.columns(), 40);
         assert_eq!(u.lines.len(), 11); // 10 viewport + 1 overscan
-        assert_eq!(line(&u, 0).cells.len(), 40);
+        assert_eq!(line(&u, 0).len(), 40);
     }
 
     #[test]
@@ -1165,7 +1222,7 @@ mod tests {
                     .iter()
                     .find(|l| l.line == 0)
                     .unwrap()
-                    .cells[0]
+                    .cell(0)
                     .codepoint
             )
             .unwrap(),
@@ -1194,15 +1251,15 @@ mod tests {
         e.advance("中".as_bytes().to_vec());
         let u = e.full_snapshot();
         let row0 = line(&u, 0);
-        assert_eq!(char::from_u32(row0.cells[0].codepoint).unwrap(), '中');
-        assert_ne!(row0.cells[0].flags & FLAG_WIDE, 0, "lead cell must be WIDE_CHAR");
+        assert_eq!(char::from_u32(row0.cell(0).codepoint).unwrap(), '中');
+        assert_ne!(row0.cell(0).flags & FLAG_WIDE, 0, "lead cell must be WIDE_CHAR");
         assert_ne!(
-            row0.cells[1].flags & FLAG_WIDE_SPACER,
+            row0.cell(1).flags & FLAG_WIDE_SPACER,
             0,
             "the cell after a wide char must be WIDE_CHAR_SPACER"
         );
         assert_eq!(
-            char::from_u32(row0.cells[1].codepoint).unwrap(),
+            char::from_u32(row0.cell(1).codepoint).unwrap(),
             ' ',
             "WIDE_CHAR_SPACER cell.c is a space placeholder"
         );
@@ -1227,12 +1284,12 @@ mod tests {
     fn maps_dim_and_strikeout_flags() {
         let mut e = engine(20, 5);
         e.advance(b"\x1b[2mD".to_vec()); // SGR 2 = dim
-        assert_ne!(line(&e.full_snapshot(), 0).cells[0].flags & FLAG_DIM, 0);
+        assert_ne!(line(&e.full_snapshot(), 0).cell(0).flags & FLAG_DIM, 0);
 
         let mut e2 = engine(20, 5);
         e2.advance(b"\x1b[9mS".to_vec()); // SGR 9 = strikeout
         assert_ne!(
-            line(&e2.full_snapshot(), 0).cells[0].flags & FLAG_STRIKEOUT,
+            line(&e2.full_snapshot(), 0).cell(0).flags & FLAG_STRIKEOUT,
             0
         );
     }
@@ -1262,7 +1319,7 @@ mod tests {
         assert_eq!(u.display_offset, 2);
         // Row 0 now shows an older line than it did at the bottom.
         let row0: String = u.lines.iter().find(|l| l.line == 0).unwrap()
-            .cells.iter().map(|c| char::from_u32(c.codepoint).unwrap()).collect();
+            .codepoints.iter().map(|c| char::from_u32(*c).unwrap()).collect();
         assert!(row0.trim_end().starts_with("line"));
         // Cursor is hidden while scrolled back.
         assert!(!u.cursor_visible);
@@ -1282,9 +1339,9 @@ mod tests {
 
         let u = e.full_snapshot();
         let row0 = u.lines.iter().find(|l| l.line == 0).unwrap();
-        assert_ne!(row0.cells[0].flags & FLAG_SELECTED, 0);
-        assert_ne!(row0.cells[4].flags & FLAG_SELECTED, 0);
-        assert_eq!(row0.cells[10].flags & FLAG_SELECTED, 0); // 'd' not selected
+        assert_ne!(row0.cell(0).flags & FLAG_SELECTED, 0);
+        assert_ne!(row0.cell(4).flags & FLAG_SELECTED, 0);
+        assert_eq!(row0.cell(10).flags & FLAG_SELECTED, 0); // 'd' not selected
 
         e.selection_clear();
         assert!(e.selection_text().is_none());
@@ -1310,7 +1367,7 @@ mod tests {
             e.selection_update(0, end_col, end_right);
             let u = e.full_snapshot();
             let row0 = u.lines.iter().find(|l| l.line == 0).unwrap();
-            let sel = |c: usize| row0.cells[c].flags & FLAG_SELECTED != 0;
+            let sel = |c: usize| row0.cell(c).flags & FLAG_SELECTED != 0;
             // At least one cell must be selected (guards against an empty range that
             // would make the equality checks below pass vacuously).
             assert!(
@@ -1348,7 +1405,7 @@ mod tests {
         e.reconfigure(cfg);
         e.advance(b"\x1b[31mR".to_vec());
         let snap = e.full_snapshot();
-        let red_cell = &snap.lines[0].cells[0];
+        let red_cell = &snap.lines[0].cell(0);
         assert_eq!(red_cell.fg & 0x00FF_FFFF, 0x00AB_CDEF);
     }
 
@@ -1375,7 +1432,7 @@ mod tests {
         let mut e = TerminalEngine::new(20, 5, cfg);
         e.advance(b"\x1b[31mR".to_vec());
         let u = e.full_snapshot();
-        assert_eq!(u.lines[0].cells[0].fg & 0x00FF_FFFF, 0x0011_2233);
+        assert_eq!(u.lines[0].cell(0).fg & 0x00FF_FFFF, 0x0011_2233);
     }
 
     #[test]
@@ -1405,11 +1462,11 @@ mod tests {
         e.advance(b"foo bar foo".to_vec());
         assert!(e.search_set("foo".to_string()));
         let u = e.full_snapshot_searched();
-        assert_ne!(u.lines[0].cells[0].flags & FLAG_MATCH, 0);
-        assert_ne!(u.lines[0].cells[0].flags & FLAG_MATCH_CURRENT, 0);
-        assert_ne!(u.lines[0].cells[8].flags & FLAG_MATCH, 0);
-        assert_eq!(u.lines[0].cells[8].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u.lines[0].cells[3].flags & (FLAG_MATCH | FLAG_MATCH_CURRENT), 0);
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(8).flags & FLAG_MATCH, 0);
+        assert_eq!(u.lines[0].cell(8).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(3).flags & (FLAG_MATCH | FLAG_MATCH_CURRENT), 0);
     }
 
     #[test]
@@ -1419,8 +1476,8 @@ mod tests {
         e.search_set("foo".to_string());
         assert!(e.search_next());
         let u = e.full_snapshot_searched();
-        assert_ne!(u.lines[0].cells[8].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u.lines[0].cells[0].flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(8).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
     }
 
     #[test]
@@ -1433,11 +1490,11 @@ mod tests {
         e.search_set("foo".to_string());      // first "foo" (col 0) focused
         assert!(e.search_next());              // second "foo" (col 8) focused
         let u1 = e.full_snapshot_searched();
-        assert_ne!(u1.lines[0].cells[8].flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u1.lines[0].cell(8).flags & FLAG_MATCH_CURRENT, 0);
         assert!(e.search_prev());              // back to first "foo"
         let u2 = e.full_snapshot_searched();
-        assert_ne!(u2.lines[0].cells[0].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u2.lines[0].cells[8].flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u2.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u2.lines[0].cell(8).flags & FLAG_MATCH_CURRENT, 0);
     }
 
     #[test]
@@ -1449,33 +1506,33 @@ mod tests {
         assert!(e.search_set("foo".to_string()));
         // After set: focus on first.
         let u = e.full_snapshot_searched();
-        assert_ne!(u.lines[0].cells[0].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u.lines[0].cells[3].flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(3).flags & FLAG_MATCH_CURRENT, 0);
 
         // next → second.
         assert!(e.search_next());
         let u = e.full_snapshot_searched();
-        assert_eq!(u.lines[0].cells[0].flags & FLAG_MATCH_CURRENT, 0);
-        assert_ne!(u.lines[0].cells[3].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u.lines[0].cells[6].flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(3).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(6).flags & FLAG_MATCH_CURRENT, 0);
 
         // next → third.
         assert!(e.search_next());
         let u = e.full_snapshot_searched();
-        assert_eq!(u.lines[0].cells[3].flags & FLAG_MATCH_CURRENT, 0);
-        assert_ne!(u.lines[0].cells[6].flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(3).flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(6).flags & FLAG_MATCH_CURRENT, 0);
 
         // prev → second.
         assert!(e.search_prev());
         let u = e.full_snapshot_searched();
-        assert_ne!(u.lines[0].cells[3].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u.lines[0].cells[6].flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(3).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(6).flags & FLAG_MATCH_CURRENT, 0);
 
         // prev → first.
         assert!(e.search_prev());
         let u = e.full_snapshot_searched();
-        assert_ne!(u.lines[0].cells[0].flags & FLAG_MATCH_CURRENT, 0);
-        assert_eq!(u.lines[0].cells[3].flags & FLAG_MATCH_CURRENT, 0);
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(3).flags & FLAG_MATCH_CURRENT, 0);
     }
 
     #[test]
@@ -1484,7 +1541,7 @@ mod tests {
         e.advance(b"foo".to_vec());
         assert!(!e.search_set("(".to_string()));
         let u = e.full_snapshot_searched();
-        assert_eq!(u.lines[0].cells[0].flags & FLAG_MATCH, 0);
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
     }
 
     #[test]
@@ -1494,7 +1551,7 @@ mod tests {
         e.search_set("foo".to_string());
         e.search_clear();
         let u = e.full_snapshot_searched();
-        assert_eq!(u.lines[0].cells[0].flags & FLAG_MATCH, 0);
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
     }
 
     #[test]
@@ -1502,7 +1559,7 @@ mod tests {
         let mut e = engine(20, 3);
         e.advance(b"\x1b]8;;https://example.com\x1b\\X\x1b]8;;\x1b\\".to_vec());
         let u = e.full_snapshot_searched();
-        let cell = &u.lines[0].cells[0];
+        let cell = &u.lines[0].cell(0);
         assert_ne!(cell.flags & FLAG_HYPERLINK, 0);
         assert_ne!(cell.hyperlink_id, 0);
         assert_eq!(
@@ -1541,8 +1598,8 @@ mod tests {
         let any_hyperlink = u
             .lines
             .iter()
-            .flat_map(|l| l.cells.iter())
-            .any(|c| c.flags & FLAG_HYPERLINK != 0);
+            .flat_map(|l| l.flags.iter())
+            .any(|f| f & FLAG_HYPERLINK != 0);
         assert!(
             !any_hyperlink,
             "engine must not auto-mark plain URLs after hint-pass removal"
