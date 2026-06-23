@@ -33,6 +33,7 @@ pub async fn engine_take_damage(engine: &mut TerminalEngine) -> RenderUpdate {
             default_bg: crate::engine::EngineConfig::default_palette()[17],
             cursor_color: crate::engine::CURSOR_COLOR_UNSET,
             scroll_fraction: 0.0,
+            scroll_line_delta: 0,
         }
     })
 }
@@ -65,17 +66,75 @@ pub fn engine_resize(engine: &mut TerminalEngine, columns: u16, rows: u16) {
     engine.resize(columns, rows);
 }
 
-pub async fn engine_scroll_lines(engine: &mut TerminalEngine, delta: i32) {
-    engine.scroll_lines(delta);
+pub async fn engine_scroll_lines(engine: &mut TerminalEngine, delta: i32) -> RenderUpdate {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.scroll_lines(delta))).unwrap_or_else(
+        |_| {
+            eprintln!("flutter_alacritty: engine_scroll_lines panicked (empty update returned)");
+            RenderUpdate {
+                lines: Vec::new(),
+                full: false,
+                cursor_line: 0,
+                cursor_col: 0,
+                cursor_visible: false,
+                cursor_shape: 0,
+                cursor_blinking: false,
+                mode_flags: 0,
+                display_offset: 0,
+                default_fg: crate::engine::EngineConfig::default_palette()[16],
+                default_bg: crate::engine::EngineConfig::default_palette()[17],
+                cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+                scroll_fraction: 0.0,
+                scroll_line_delta: 0,
+            }
+        },
+    )
 }
 
 /// Sub-cell pixel scroll. Positive `delta_px` scrolls up into history.
-pub async fn engine_scroll_pixels(engine: &mut TerminalEngine, delta_px: f64) {
-    engine.scroll_pixels(delta_px);
+pub async fn engine_scroll_pixels(engine: &mut TerminalEngine, delta_px: f64) -> RenderUpdate {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.scroll_pixels(delta_px))).unwrap_or_else(
+        |_| {
+            eprintln!("flutter_alacritty: engine_scroll_pixels panicked (empty update returned)");
+            RenderUpdate {
+                lines: Vec::new(),
+                full: false,
+                cursor_line: 0,
+                cursor_col: 0,
+                cursor_visible: false,
+                cursor_shape: 0,
+                cursor_blinking: false,
+                mode_flags: 0,
+                display_offset: 0,
+                default_fg: crate::engine::EngineConfig::default_palette()[16],
+                default_bg: crate::engine::EngineConfig::default_palette()[17],
+                cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+                scroll_fraction: 0.0,
+                scroll_line_delta: 0,
+            }
+        },
+    )
 }
 
-pub async fn engine_scroll_to_bottom(engine: &mut TerminalEngine) {
-    engine.scroll_to_bottom();
+pub async fn engine_scroll_to_bottom(engine: &mut TerminalEngine) -> RenderUpdate {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.scroll_to_bottom())).unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_to_bottom panicked (empty update returned)");
+        RenderUpdate {
+            lines: Vec::new(),
+            full: false,
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            cursor_shape: 0,
+            cursor_blinking: false,
+            mode_flags: 0,
+            display_offset: 0,
+            default_fg: crate::engine::EngineConfig::default_palette()[16],
+            default_bg: crate::engine::EngineConfig::default_palette()[17],
+            cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+            scroll_fraction: 0.0,
+            scroll_line_delta: 0,
+        }
+    })
 }
 
 #[frb(sync)]
@@ -132,6 +191,11 @@ pub fn engine_search_prev(engine: &mut TerminalEngine) -> bool {
 #[frb(sync)]
 pub fn engine_search_clear(engine: &mut TerminalEngine) {
     engine.search_clear();
+}
+
+#[frb(sync)]
+pub fn engine_search_is_active(engine: &TerminalEngine) -> bool {
+    engine.search_is_active()
 }
 
 #[frb(sync)]

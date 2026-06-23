@@ -132,6 +132,11 @@ pub struct RenderUpdate {
     /// revealed top sliver with the overscan row (the last entry in `lines` on
     /// a full update). 0.0 when sitting on a line boundary.
     pub scroll_fraction: f64,
+    /// Net viewport line scroll since the last mirror state. Positive = scrolled
+    /// up into history. Zero on full updates and on sub-cell-only pixel scrolls.
+    /// The Dart mirror rotates existing rows by this delta before applying
+    /// [lines], so scroll refresh only ships the edge rows that entered view.
+    pub scroll_line_delta: i32,
 }
 
 impl RenderUpdate {
@@ -215,6 +220,9 @@ pub const FLAG_WIDE_SPACER: u16 = 1 << 5;
 pub const FLAG_DIM: u16 = 1 << 6;
 pub const FLAG_STRIKEOUT: u16 = 1 << 7;
 pub const FLAG_SELECTED: u16 = 1 << 8;
+/// Sentinel `LineUpdate.line` on incremental scroll refreshes (not full snapshots,
+/// which tag overscan with `screen_lines` as the last viewport entry).
+pub const OVERSCAN_LINE_TAG: u32 = u32::MAX;
 pub const FLAG_MATCH: u16 = 1 << 9;
 pub const FLAG_MATCH_CURRENT: u16 = 1 << 10;
 pub const FLAG_HYPERLINK: u16 = 1 << 11;
@@ -443,11 +451,16 @@ impl TerminalEngine {
         self.term.resize(size);
     }
 
-    pub fn scroll_lines(&mut self, delta: i32) {
+    pub fn search_is_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn scroll_lines(&mut self, delta: i32) -> RenderUpdate {
         // Discrete scrolls (keyboard, wheel notches without pixel deltas) snap to
         // a line boundary — drop any accumulated sub-cell offset.
         self.scroll_fraction = 0.0;
         self.term.scroll_display(Scroll::Delta(delta));
+        self.after_scroll_refresh(delta)
     }
 
     /// Scroll by a pixel delta with sub-cell precision. Positive `delta_px`
@@ -455,35 +468,36 @@ impl TerminalEngine {
     /// back down toward the live edge. The fractional remainder is kept in
     /// `scroll_fraction` ∈ [0.0, 1.0) and the line-level `display_offset` is
     /// stepped whenever the accumulator crosses a cell boundary.
-    pub fn scroll_pixels(&mut self, delta_px: f64) {
+    pub fn scroll_pixels(&mut self, delta_px: f64) -> RenderUpdate {
         if self.cell_h == 0 {
             // Cell height not reported yet (set_cell_pixels pending) — degrade to
             // a rounded line scroll so input is never dropped on the first frames.
             let lines = (delta_px / DEFAULT_CELL_HEIGHT_PX).round() as i32;
             if lines != 0 {
-                self.scroll_lines(lines);
+                return self.scroll_lines(lines);
             }
-            return;
+            return self.scroll_refresh(0);
         }
+        let before = self.term.grid().display_offset();
         self.scroll_fraction += delta_px / self.cell_h as f64;
         // Step display_offset one line at a time as the accumulator crosses each
         // cell boundary. Break (and snap the fraction flush) if we hit a
         // scrollback bound so the content never floats off a hard edge.
         while self.scroll_fraction >= 1.0 {
-            let before = self.term.grid().display_offset();
+            let step_before = self.term.grid().display_offset();
             self.term.scroll_display(Scroll::Delta(1));
-            if self.term.grid().display_offset() == before {
+            if self.term.grid().display_offset() == step_before {
                 self.scroll_fraction = 0.0;
-                return;
+                return self.after_scroll_refresh(0);
             }
             self.scroll_fraction -= 1.0;
         }
         while self.scroll_fraction < 0.0 {
-            let before = self.term.grid().display_offset();
+            let step_before = self.term.grid().display_offset();
             self.term.scroll_display(Scroll::Delta(-1));
-            if self.term.grid().display_offset() == before {
+            if self.term.grid().display_offset() == step_before {
                 self.scroll_fraction = 0.0;
-                return;
+                return self.after_scroll_refresh(0);
             }
             self.scroll_fraction += 1.0;
         }
@@ -497,11 +511,18 @@ impl TerminalEngine {
         {
             self.scroll_fraction = 0.0;
         }
+        let after = self.term.grid().display_offset();
+        let line_delta = after as i32 - before as i32;
+        self.after_scroll_refresh(line_delta)
     }
 
-    pub fn scroll_to_bottom(&mut self) {
+    pub fn scroll_to_bottom(&mut self) -> RenderUpdate {
+        let before = self.term.grid().display_offset();
         self.scroll_fraction = 0.0;
         self.term.scroll_display(Scroll::Bottom);
+        let after = self.term.grid().display_offset();
+        let line_delta = after as i32 - before as i32;
+        self.after_scroll_refresh(line_delta)
     }
 
     pub fn clear_history(&mut self) {
@@ -853,6 +874,145 @@ impl TerminalEngine {
         )
     }
 
+    fn apply_wide_selection_pair(cells: &mut [CellData]) {
+        for c in 0..cells.len().saturating_sub(1) {
+            let lead_wide = cells[c].flags & FLAG_WIDE != 0;
+            let next_spacer = cells[c + 1].flags & FLAG_WIDE_SPACER != 0;
+            if lead_wide && next_spacer {
+                let selected =
+                    (cells[c].flags | cells[c + 1].flags) & FLAG_SELECTED != 0;
+                if selected {
+                    cells[c].flags |= FLAG_SELECTED;
+                    cells[c + 1].flags |= FLAG_SELECTED;
+                }
+            }
+        }
+    }
+
+    fn after_scroll_refresh(&mut self, line_delta: i32) -> RenderUpdate {
+        if self.search.is_some() {
+            return self.full_snapshot_searched();
+        }
+        let rows = self.term.screen_lines();
+        if line_delta.abs() as usize >= rows {
+            return self.full_snapshot();
+        }
+        self.scroll_refresh(line_delta)
+    }
+
+    /// Incremental scroll refresh: rotate on the Dart mirror, ship only edge
+    /// rows + overscan + chrome. Falls back to [full_snapshot] when the jump is
+    /// too large or search is active.
+    fn scroll_refresh(&mut self, line_delta: i32) -> RenderUpdate {
+        let rows = self.term.screen_lines();
+        let display_offset = self.term.grid().display_offset();
+        let mut lines = Vec::new();
+        if line_delta > 0 {
+            let d = (line_delta as usize).min(rows);
+            for vp in 0..d {
+                lines.push(self.pack_viewport_line(vp));
+            }
+        } else if line_delta < 0 {
+            let d = ((-line_delta) as usize).min(rows);
+            let start = rows.saturating_sub(d);
+            for vp in start..rows {
+                lines.push(self.pack_viewport_line(vp));
+            }
+        }
+        lines.push(self.overscan_line_update(rows));
+        let (cursor_line, cursor_col, cursor_visible, cursor_shape, cursor_blinking) =
+            self.cursor_fields();
+        let (default_fg, default_bg, cursor_color) = self.chrome_colors();
+        RenderUpdate {
+            lines,
+            full: false,
+            cursor_line,
+            cursor_col,
+            cursor_visible: cursor_visible && display_offset == 0,
+            cursor_shape,
+            cursor_blinking,
+            mode_flags: self.term.mode().bits(),
+            display_offset: display_offset as u32,
+            default_fg,
+            default_bg,
+            cursor_color,
+            scroll_fraction: self.scroll_fraction,
+            scroll_line_delta: line_delta,
+        }
+    }
+
+    fn pack_viewport_line(&mut self, vp_row: usize) -> LineUpdate {
+        let display_offset = self.term.grid().display_offset();
+        let cols = self.term.columns();
+        let sel = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&self.term));
+        let collected: Vec<(usize, Cell)> = {
+            let grid = self.term.grid();
+            (0..cols)
+                .map(|c| {
+                    let p = viewport_to_point(display_offset, Point::new(vp_row, Column(c)));
+                    (c, grid[p].clone())
+                })
+                .collect()
+        };
+        let mut cells = Vec::with_capacity(cols);
+        for (c, cell) in collected {
+            let p = viewport_to_point(display_offset, Point::new(vp_row, Column(c)));
+            let mut cd = self.cell_data(&cell);
+            if let Some(ref r) = sel {
+                if point_in_range(p, r) {
+                    cd.flags |= FLAG_SELECTED;
+                }
+            }
+            cells.push(cd);
+        }
+        if sel.is_some() {
+            Self::apply_wide_selection_pair(&mut cells);
+        }
+        LineUpdate::from_cells(vp_row as u32, cells)
+    }
+
+    fn overscan_line_update(&mut self, _rows: usize) -> LineUpdate {
+        let cols = self.term.columns();
+        let display_offset = self.term.grid().display_offset();
+        let blank = CellData {
+            codepoint: ' ' as u32,
+            fg: self.live_named(NamedColor::Foreground, self.palette[16]),
+            bg: self.live_named(NamedColor::Background, self.palette[17]),
+            flags: 0,
+            hyperlink_id: 0,
+        };
+        let mut cells = vec![blank; cols];
+        let sel = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&self.term));
+        if (display_offset as usize) < self.term.grid().history_size() {
+            let over_line = Line(-(display_offset as i32) - 1);
+            let over_cells: Vec<Cell> = {
+                let grid = self.term.grid();
+                (0..cols).map(|c| grid[over_line][Column(c)].clone()).collect()
+            };
+            for (col, cell) in over_cells.into_iter().enumerate() {
+                let mut cd = self.cell_data(&cell);
+                if let Some(ref r) = sel {
+                    if point_in_range(Point::new(over_line, Column(col)), r) {
+                        cd.flags |= FLAG_SELECTED;
+                    }
+                }
+                cells[col] = cd;
+            }
+            if sel.is_some() {
+                Self::apply_wide_selection_pair(&mut cells);
+            }
+        }
+        LineUpdate::from_cells(OVERSCAN_LINE_TAG, cells)
+    }
+
     pub fn full_snapshot(&mut self) -> RenderUpdate {
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
@@ -960,6 +1120,7 @@ impl TerminalEngine {
             default_bg,
             cursor_color,
             scroll_fraction: self.scroll_fraction,
+            scroll_line_delta: 0,
         }
     }
 
@@ -1011,6 +1172,7 @@ impl TerminalEngine {
                     default_bg,
                     cursor_color,
                     scroll_fraction: 0.0,
+                    scroll_line_delta: 0,
                 }
             }
         };
@@ -1326,6 +1488,24 @@ mod tests {
 
         e.scroll_to_bottom();
         assert_eq!(e.full_snapshot().display_offset, 0);
+    }
+
+    #[test]
+    fn scroll_refresh_ships_edge_rows_not_full_grid() {
+        let mut e = engine(10, 5);
+        for i in 0..20 {
+            e.advance(format!("{:02}\r\n", i).into_bytes());
+        }
+        let u = e.scroll_lines(1);
+        assert!(!u.full);
+        assert_eq!(u.scroll_line_delta, 1);
+        assert_eq!(u.lines.len(), 2, "viewport edge + overscan");
+        assert!(u.lines.iter().any(|l| l.line == 0));
+        assert!(u.lines.iter().any(|l| l.line == OVERSCAN_LINE_TAG));
+        let scrolled_full = e.full_snapshot();
+        let edge = u.lines.iter().find(|l| l.line == 0).unwrap();
+        let full_r0 = scrolled_full.lines.iter().find(|l| l.line == 0).unwrap();
+        assert_eq!(edge.codepoints, full_r0.codepoints);
     }
 
     #[test]
