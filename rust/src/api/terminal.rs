@@ -29,6 +29,7 @@ pub async fn engine_take_damage(engine: &mut TerminalEngine) -> RenderUpdate {
             cursor_blinking: false,
             mode_flags: 0,
             display_offset: 0,
+            history_size: 0,
             default_fg: crate::engine::EngineConfig::default_palette()[16],
             default_bg: crate::engine::EngineConfig::default_palette()[17],
             cursor_color: crate::engine::CURSOR_COLOR_UNSET,
@@ -80,6 +81,7 @@ pub async fn engine_scroll_lines(engine: &mut TerminalEngine, delta: i32) -> Ren
                 cursor_blinking: false,
                 mode_flags: 0,
                 display_offset: 0,
+                history_size: 0,
                 default_fg: crate::engine::EngineConfig::default_palette()[16],
                 default_bg: crate::engine::EngineConfig::default_palette()[17],
                 cursor_color: crate::engine::CURSOR_COLOR_UNSET,
@@ -105,6 +107,7 @@ pub async fn engine_scroll_pixels(engine: &mut TerminalEngine, delta_px: f64) ->
                 cursor_blinking: false,
                 mode_flags: 0,
                 display_offset: 0,
+                history_size: 0,
                 default_fg: crate::engine::EngineConfig::default_palette()[16],
                 default_bg: crate::engine::EngineConfig::default_palette()[17],
                 cursor_color: crate::engine::CURSOR_COLOR_UNSET,
@@ -128,6 +131,7 @@ pub async fn engine_scroll_to_bottom(engine: &mut TerminalEngine) -> RenderUpdat
             cursor_blinking: false,
             mode_flags: 0,
             display_offset: 0,
+            history_size: 0,
             default_fg: crate::engine::EngineConfig::default_palette()[16],
             default_bg: crate::engine::EngineConfig::default_palette()[17],
             cursor_color: crate::engine::CURSOR_COLOR_UNSET,
@@ -135,6 +139,59 @@ pub async fn engine_scroll_to_bottom(engine: &mut TerminalEngine) -> RenderUpdat
             scroll_line_delta: 0,
         }
     })
+}
+
+pub async fn engine_scroll_to_top(engine: &mut TerminalEngine) -> RenderUpdate {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.scroll_to_top())).unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_to_top panicked (empty update returned)");
+        RenderUpdate {
+            lines: Vec::new(),
+            full: false,
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            cursor_shape: 0,
+            cursor_blinking: false,
+            mode_flags: 0,
+            display_offset: 0,
+            history_size: 0,
+            default_fg: crate::engine::EngineConfig::default_palette()[16],
+            default_bg: crate::engine::EngineConfig::default_palette()[17],
+            cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+            scroll_fraction: 0.0,
+            scroll_line_delta: 0,
+        }
+    })
+}
+
+/// Absolute scroll position in lines (`0` = live bottom, `history_size` = top).
+pub async fn engine_scroll_to_offset(
+    engine: &mut TerminalEngine,
+    offset_lines: f64,
+) -> RenderUpdate {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.scroll_to_offset(offset_lines)))
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "flutter_alacritty: engine_scroll_to_offset panicked (empty update returned)"
+            );
+            RenderUpdate {
+                lines: Vec::new(),
+                full: false,
+                cursor_line: 0,
+                cursor_col: 0,
+                cursor_visible: false,
+                cursor_shape: 0,
+                cursor_blinking: false,
+            mode_flags: 0,
+            display_offset: 0,
+                history_size: 0,
+                default_fg: crate::engine::EngineConfig::default_palette()[16],
+                default_bg: crate::engine::EngineConfig::default_palette()[17],
+                cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+                scroll_fraction: 0.0,
+                scroll_line_delta: 0,
+            }
+        })
 }
 
 #[frb(sync)]

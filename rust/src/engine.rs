@@ -123,6 +123,8 @@ pub struct RenderUpdate {
     pub cursor_blinking: bool,
     pub mode_flags: u32,
     pub display_offset: u32,
+    /// Scrollback lines above the viewport (`total_lines - screen_lines`).
+    pub history_size: u32,
     pub default_fg: u32,
     pub default_bg: u32,
     pub cursor_color: u32,
@@ -513,13 +515,86 @@ impl TerminalEngine {
         }
         let after = self.term.grid().display_offset();
         let line_delta = after as i32 - before as i32;
+        self.snap_history_edge_after_pixels(delta_px);
         self.after_scroll_refresh(line_delta)
+    }
+
+    /// When pan/fling coasts within one line of a hard edge, snap flush so drag
+    /// can reach the true top/bottom (VTE `scroll_to_bottom` / `scroll_to_top`).
+    fn snap_history_edge_after_pixels(&mut self, delta_px: f64) {
+        if delta_px < 0.0 {
+            let pos = self.term.grid().display_offset() as f64 + self.scroll_fraction;
+            if pos > 0.0 && pos < 1.0 {
+                self.scroll_fraction = 0.0;
+                if self.term.grid().display_offset() > 0 {
+                    self.term.scroll_display(Scroll::Bottom);
+                }
+            }
+        } else if delta_px > 0.0 {
+            let hist = self.term.grid().history_size() as f64;
+            if hist > 0.0 {
+                let pos = self.term.grid().display_offset() as f64 + self.scroll_fraction;
+                let dist = hist - pos;
+                if dist > 0.0 && dist < 1.0 {
+                    self.scroll_fraction = 0.0;
+                    if (self.term.grid().display_offset() as usize)
+                        < self.term.grid().history_size()
+                    {
+                        self.term.scroll_display(Scroll::Top);
+                    }
+                }
+            }
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) -> RenderUpdate {
         let before = self.term.grid().display_offset();
         self.scroll_fraction = 0.0;
         self.term.scroll_display(Scroll::Bottom);
+        let after = self.term.grid().display_offset();
+        let line_delta = after as i32 - before as i32;
+        self.after_scroll_refresh(line_delta)
+    }
+
+    pub fn scroll_to_top(&mut self) -> RenderUpdate {
+        let before = self.term.grid().display_offset();
+        self.scroll_fraction = 0.0;
+        self.term.scroll_display(Scroll::Top);
+        let after = self.term.grid().display_offset();
+        let line_delta = after as i32 - before as i32;
+        self.after_scroll_refresh(line_delta)
+    }
+
+    /// Absolute scroll position in lines (GtkAdjustment `value` semantics).
+    /// `0.0` = live bottom; `history_size` = top of scrollback. Fractional
+    /// values retain sub-cell `scroll_fraction` between line boundaries.
+    pub fn scroll_to_offset(&mut self, offset_lines: f64) -> RenderUpdate {
+        let history = self.term.grid().history_size() as f64;
+        if history <= 0.0 {
+            return self.scroll_refresh(0);
+        }
+        let target = offset_lines.clamp(0.0, history);
+        if target <= f64::EPSILON {
+            return self.scroll_to_bottom();
+        }
+        if target >= history - f64::EPSILON {
+            return self.scroll_to_top();
+        }
+
+        let before = self.term.grid().display_offset();
+        let target_line = target.floor() as i32;
+        let target_frac = target - target.floor();
+
+        self.scroll_fraction = 0.0;
+        let delta = target_line - before as i32;
+        if delta != 0 {
+            self.term.scroll_display(Scroll::Delta(delta));
+        }
+        self.scroll_fraction = target_frac;
+        if self.term.grid().display_offset() >= self.term.grid().history_size() {
+            self.scroll_fraction = 0.0;
+        }
+
         let after = self.term.grid().display_offset();
         let line_delta = after as i32 - before as i32;
         self.after_scroll_refresh(line_delta)
@@ -889,6 +964,11 @@ impl TerminalEngine {
         }
     }
 
+    #[inline]
+    fn history_size_u32(&self) -> u32 {
+        self.term.grid().history_size() as u32
+    }
+
     fn after_scroll_refresh(&mut self, line_delta: i32) -> RenderUpdate {
         if self.search.is_some() {
             return self.full_snapshot_searched();
@@ -933,6 +1013,7 @@ impl TerminalEngine {
             cursor_blinking,
             mode_flags: self.term.mode().bits(),
             display_offset: display_offset as u32,
+            history_size: self.history_size_u32(),
             default_fg,
             default_bg,
             cursor_color,
@@ -1116,6 +1197,7 @@ impl TerminalEngine {
             cursor_blinking,
             mode_flags: self.term.mode().bits(),
             display_offset: display_offset as u32,
+            history_size: self.history_size_u32(),
             default_fg,
             default_bg,
             cursor_color,
@@ -1168,6 +1250,7 @@ impl TerminalEngine {
                     cursor_blinking,
                     mode_flags: self.term.mode().bits(),
                     display_offset: 0,
+                    history_size: self.history_size_u32(),
                     default_fg,
                     default_bg,
                     cursor_color,
@@ -1997,5 +2080,60 @@ mod tests {
         let u = e.full_snapshot();
         assert_eq!(u.display_offset, 0);
         assert_eq!(u.scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn scroll_to_top_pins_offset_and_clears_fraction() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+        e.scroll_pixels(9.0);
+        let u = e.scroll_to_top();
+        assert_eq!(u.display_offset as usize, e.term.grid().history_size());
+        assert_eq!(u.scroll_fraction, 0.0);
+        assert_eq!(u.history_size as usize, e.term.grid().history_size());
+    }
+
+    #[test]
+    fn scroll_pixels_snaps_near_live_bottom() {
+        let mut e = engine(10, 2);
+        fill_lines(&mut e, 6);
+        e.set_cell_pixels(9, 18);
+        e.scroll_lines(1); // display_offset 1
+        e.scroll_pixels(-10.0); // coast to ~0.45 lines from bottom → snap flush
+        let u = e.full_snapshot();
+        assert_eq!(u.display_offset, 0);
+        assert_eq!(u.scroll_fraction, 0.0);
+    }
+
+    #[test]
+    fn scroll_to_offset_absolute_position() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.set_cell_pixels(9, 18);
+        let history = e.term.grid().history_size() as f64;
+        let u = e.scroll_to_offset(history * 0.5);
+        assert!((u.display_offset as f64 + u.scroll_fraction - history * 0.5).abs() < 0.01);
+        let bottom = e.scroll_to_offset(0.0);
+        assert_eq!(bottom.display_offset, 0);
+        assert_eq!(bottom.scroll_fraction, 0.0);
+        let top = e.scroll_to_offset(history);
+        assert_eq!(top.display_offset as usize, e.term.grid().history_size());
+    }
+
+    #[test]
+    fn scroll_refresh_carries_history_size() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 8);
+        let u = e.scroll_lines(1);
+        assert_eq!(u.history_size as usize, e.term.grid().history_size());
+    }
+
+    #[test]
+    fn render_update_carries_live_history_size() {
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 8);
+        let u = e.full_snapshot();
+        assert_eq!(u.history_size as usize, e.term.grid().history_size());
     }
 }
