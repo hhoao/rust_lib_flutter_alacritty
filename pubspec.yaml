@@ -2,7 +2,7 @@ name: rust_lib_flutter_alacritty
 description: >-
   FFI plugin that builds the Alacritty-based terminal engine (Rust/cdylib)
   for the flutter_alacritty package.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/hhoao/rust_lib_flutter_alacritty
 issue_tracker: https://github.com/hhoao/rust_lib_flutter_alacritty/issues
 homepage: https://github.com/hhoao/rust_lib_flutter_alacritty
