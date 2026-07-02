@@ -1,0 +1,20 @@
+# Publish rust_lib_flutter_alacritty to pub.dev when a version tag is pushed.
+# OIDC trust must be configured on pub.dev (Admin → Automated publishing).
+# See PUBLISHING.md in the flutter_alacritty repo.
+
+name: Publish to pub.dev
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish rust_lib_flutter_alacritty
+    permissions:
+      id-token: write # Required for pub.dev OIDC
+    uses: dart-lang/setup-dart/.github/workflows/publish.yml@65eb853c7ba17dde3be364c3d2858773e7144260
