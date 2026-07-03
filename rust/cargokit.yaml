@@ -4,4 +4,4 @@
 # Binaries are published to GitHub Releases under tags `precompiled_<crate-hash>`.
 precompiled_binaries:
   url_prefix: https://github.com/hhoao/rust_lib_flutter_alacritty/releases/download/precompiled_
-  public_key: 109b709c4066743cc84cea1b8b472ca854e65d96597e35a4c72e66a23847d10d
+  public_key: b1d2307c82294272c2b97bd358a43d71b7e323e2fd8eb0728d2e94b726210171
