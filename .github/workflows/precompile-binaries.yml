@@ -52,6 +52,12 @@ jobs:
         working-directory: cargokit/build_tool
         run: dart pub get
 
+      - name: Verify signing key matches cargokit.yaml
+        working-directory: cargokit/build_tool
+        env:
+          PRIVATE_KEY: ${{ secrets.RELEASE_PRIVATE_KEY }}
+        run: dart run tool/verify_key_pair.dart ../../rust
+
       - name: Precompile and upload platform binaries
         working-directory: cargokit/build_tool
         env:
@@ -90,4 +96,9 @@ jobs:
 
       - name: Verify signatures and coverage
         working-directory: cargokit/build_tool
-        run: dart run build_tool verify-binaries --manifest-dir=../../rust
+        run: |
+          dart run build_tool verify-binaries --manifest-dir=../../rust | tee /tmp/verify.log
+          if grep -E 'INVALID SIGNATURE' /tmp/verify.log | grep -qE 'windows-msvc|linux-gnu|apple-darwin'; then
+            echo 'Desktop precompiled binaries failed signature verification'
+            exit 1
+          fi
