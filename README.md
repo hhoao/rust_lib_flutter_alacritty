@@ -10,9 +10,16 @@ instead.
 
 ## Layout
 
-- `rust/` — Rust crate (`rust_lib_flutter_alacritty`)
+- `rust/` — Rust crate (`rust_lib_flutter_alacritty`) + `cargokit.yaml`
 - `cargokit/` — native build integration
+- `lib/precompiled_loader.dart` — download verified release binaries (tests)
 - Platform folders — Android, iOS, Linux, macOS, Windows plugin glue
+
+## Precompiled binaries
+
+Consumers without Rust download signed artifacts during `flutter build`. See
+[docs/PRECOMPILED_BINARIES.md](docs/PRECOMPILED_BINARIES.md) for maintainer CI
+setup (`RELEASE_GITHUB_TOKEN`, `RELEASE_PRIVATE_KEY` secrets).
 
 ## License
 

@@ -1,3 +1,11 @@
+## 0.2.1
+
+- Add Cargokit precompiled-binary support (`rust/cargokit.yaml`).
+- GitHub Actions workflow uploads signed release artifacts for Linux, macOS, and
+  Windows; macOS cdylibs are also published for Dart/widget tests.
+- Export `precompiled_loader.dart` for downloading verified binaries in tests.
+- Document setup in `docs/PRECOMPILED_BINARIES.md`.
+
 ## 0.2.0
 
 - Runtime palette and terminal option reconfiguration; OSC 997 color-scheme
