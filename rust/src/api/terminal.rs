@@ -1,4 +1,4 @@
-pub use crate::engine::{CellData, EngineConfig, LineUpdate, RenderUpdate, TerminalEngine};
+pub use crate::engine::{CellData, EngineConfig, LineUpdate, RenderUpdate, SearchOptions, TerminalEngine};
 pub use crate::event_proxy::EngineEvent;
 
 use flutter_rust_bridge::frb;
@@ -231,8 +231,13 @@ pub fn engine_selection_text(engine: &TerminalEngine) -> Option<String> {
 }
 
 #[frb(sync)]
-pub fn engine_search_set(engine: &mut TerminalEngine, pattern: String) -> bool {
-    std::panic::catch_unwind(AssertUnwindSafe(|| engine.search_set(pattern))).unwrap_or(false)
+pub fn engine_search_set(
+    engine: &mut TerminalEngine,
+    pattern: String,
+    options: SearchOptions,
+) -> bool {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.search_set(pattern, options)))
+        .unwrap_or(false)
 }
 
 #[frb(sync)]
