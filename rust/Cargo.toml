@@ -13,10 +13,12 @@ flutter_rust_bridge = "=2.12.0"
 # the engine forward. To hack on alacritty locally, uncomment the [patch] below.
 alacritty_terminal = { git = "https://github.com/alacritty/alacritty.git", rev = "55f12aae2930b48d8727ae49ea1e472af16a9247" }
 
-# Local development override: point the pinned git dep at a local checkout so you
-# can modify the engine and rebuild without pushing. Adjust the path as needed.
-# [patch."https://github.com/alacritty/alacritty.git"]
-# alacritty_terminal = { path = "/home/hhoa/git/opensource/alacritty/alacritty_terminal" }
+# TEMPORARY local override for T0 correctness (Task 5/6): needs
+# RegexSearch::with_case_insensitive from feature/regex-search-case-flag.
+# Absolute path — breaks CI / other machines. Replace with a fork `rev`
+# (or upstream once merged) before publish. See README.
+[patch."https://github.com/alacritty/alacritty.git"]
+alacritty_terminal = { path = "/home/hhoa/git/opensource/alacritty/alacritty_terminal" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
