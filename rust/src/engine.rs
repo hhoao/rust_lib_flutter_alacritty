@@ -10,7 +10,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
+use alacritty_terminal::term::search::{BuildError, Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 
@@ -184,6 +184,47 @@ impl EngineConfig {
     }
 }
 
+/// Options for terminal buffer search (FRB-visible via `api::search_options`).
+///
+/// Defaults match GNOME Terminal-style find: case-insensitive, not whole-word,
+/// regex enabled, wrap around.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+    pub wrap: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            case_sensitive: false,
+            whole_word: false,
+            regex: true,
+            wrap: true,
+        }
+    }
+}
+
+/// Compile a search pattern with [`SearchOptions`].
+///
+/// Case-insensitivity is applied via `RegexSearch::with_case_insensitive` — never
+/// by embedding `(?i)` (that breaks `\b` whole-word boundaries under regex-syntax).
+fn compile_search(pattern: &str, opt: &SearchOptions) -> Result<RegexSearch, Box<BuildError>> {
+    let mut pat = if opt.regex {
+        pattern.to_string()
+    } else {
+        regex_syntax::escape(pattern)
+    };
+    // ASCII `\b` only: Unicode word boundaries are unsupported by alacritty's
+    // lazy DFAs. Never embed `(?i)` here — case comes from SyntaxConfig.
+    if opt.whole_word {
+        pat = format!(r"(?-u:\b)(?:{})(?-u:\b)", pat);
+    }
+    RegexSearch::with_case_insensitive(&pat, !opt.case_sensitive)
+}
+
 fn build_term_config(c: &EngineConfig) -> Config {
     use alacritty_terminal::term::Osc52;
     use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
@@ -322,6 +363,8 @@ pub struct TerminalEngine {
     cell_h: u16,
     palette: [u32; 18],
     search: Option<RegexSearch>,
+    /// When false, `search_step` rejects wrap-around hits (GNOME "wrap off").
+    search_wrap: bool,
     current_match: Option<Match>,
     hyperlinks: Vec<String>,
     hyperlink_ids: HashMap<String, u32>,
@@ -373,6 +416,7 @@ impl TerminalEngine {
             cell_h: 0,
             palette,
             search: None,
+            search_wrap: true,
             current_match: None,
             hyperlinks: Vec::new(),
             hyperlink_ids: HashMap::new(),
@@ -650,10 +694,11 @@ impl TerminalEngine {
         self.term.selection_to_string()
     }
 
-    pub fn search_set(&mut self, pattern: String) -> bool {
-        match RegexSearch::new(&pattern) {
+    pub fn search_set(&mut self, pattern: String, opt: SearchOptions) -> bool {
+        match compile_search(&pattern, &opt) {
             Ok(re) => {
                 self.search = Some(re);
+                self.search_wrap = opt.wrap;
                 self.current_match = None;
                 self.search_step(Direction::Right);
                 true
@@ -715,14 +760,29 @@ impl TerminalEngine {
             }
         };
         let re = self.search.as_mut().unwrap();
+        // Always search with max_lines: None. wrap=false is enforced below —
+        // do NOT pass Some(total_lines-1): alacritty filters that to None (no-op).
         let found = self.term.search_next(re, origin, direction, Side::Left, None);
         match found {
-            Some(m) => {
+            Some(m)
+                if self.search_wrap
+                    || !Self::match_wrapped_past_origin(&m, origin, direction) =>
+            {
                 self.term.scroll_to_point(*m.start());
                 self.current_match = Some(m);
                 true
             }
-            None => false,
+            _ => false,
+        }
+    }
+
+    /// True when `m` is a wrap-around hit relative to `origin`.
+    /// Right: match starts before origin (went past end back to top).
+    /// Left: match starts after origin (went past start back to bottom).
+    fn match_wrapped_past_origin(m: &Match, origin: Point, direction: Direction) -> bool {
+        match direction {
+            Direction::Right => *m.start() < origin,
+            Direction::Left => *m.start() > origin,
         }
     }
 
@@ -1723,7 +1783,7 @@ mod tests {
     fn search_set_marks_matches_and_focuses_first() {
         let mut e = engine(20, 5);
         e.advance(b"foo bar foo".to_vec());
-        assert!(e.search_set("foo".to_string()));
+        assert!(e.search_set("foo".to_string(), SearchOptions::default()));
         let u = e.full_snapshot_searched();
         assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
         assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
@@ -1736,7 +1796,7 @@ mod tests {
     fn search_next_moves_focus_to_the_second_match() {
         let mut e = engine(20, 5);
         e.advance(b"foo bar foo".to_vec());
-        e.search_set("foo".to_string());
+        e.search_set("foo".to_string(), SearchOptions::default());
         assert!(e.search_next());
         let u = e.full_snapshot_searched();
         assert_ne!(u.lines[0].cell(8).flags & FLAG_MATCH_CURRENT, 0);
@@ -1750,7 +1810,7 @@ mod tests {
         // Fix uses Point::sub(.., Boundary::None, 1) to step past it.
         let mut e = engine(20, 5);
         e.advance(b"foo bar foo".to_vec());
-        e.search_set("foo".to_string());      // first "foo" (col 0) focused
+        e.search_set("foo".to_string(), SearchOptions::default());      // first "foo" (col 0) focused
         assert!(e.search_next());              // second "foo" (col 8) focused
         let u1 = e.full_snapshot_searched();
         assert_ne!(u1.lines[0].cell(8).flags & FLAG_MATCH_CURRENT, 0);
@@ -1766,7 +1826,7 @@ mod tests {
         // failing scenario ("同行多匹配 ↓ 不动").
         let mut e = engine(20, 5);
         e.advance(b"foofoofoo".to_vec());
-        assert!(e.search_set("foo".to_string()));
+        assert!(e.search_set("foo".to_string(), SearchOptions::default()));
         // After set: focus on first.
         let u = e.full_snapshot_searched();
         assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
@@ -1802,7 +1862,7 @@ mod tests {
     fn invalid_regex_returns_false_and_highlights_nothing() {
         let mut e = engine(20, 5);
         e.advance(b"foo".to_vec());
-        assert!(!e.search_set("(".to_string()));
+        assert!(!e.search_set("(".to_string(), SearchOptions::default()));
         let u = e.full_snapshot_searched();
         assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
     }
@@ -1811,10 +1871,88 @@ mod tests {
     fn search_clear_removes_highlight() {
         let mut e = engine(20, 5);
         e.advance(b"foo".to_vec());
-        e.search_set("foo".to_string());
+        e.search_set("foo".to_string(), SearchOptions::default());
         e.search_clear();
         let u = e.full_snapshot_searched();
         assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
+    }
+
+    #[test]
+    fn search_literal_dot_does_not_match_any_char() {
+        let mut e = engine(20, 5);
+        e.advance(b"a.b axb".to_vec());
+        let opt = SearchOptions {
+            regex: false,
+            ..SearchOptions::default()
+        };
+        assert!(e.search_set(".".to_string(), opt));
+        let u = e.full_snapshot_searched();
+        // Literal '.' at col 1 only — not every character.
+        assert_ne!(u.lines[0].cell(1).flags & FLAG_MATCH, 0);
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
+        assert_eq!(u.lines[0].cell(4).flags & FLAG_MATCH, 0); // 'a' of axb
+        assert_eq!(u.lines[0].cell(5).flags & FLAG_MATCH, 0); // 'x'
+    }
+
+    #[test]
+    fn search_whole_word_skips_mid_token() {
+        let mut e = engine(20, 5);
+        e.advance(b"foobar foo".to_vec());
+        let opt = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::default()
+        };
+        assert!(e.search_set("foo".to_string(), opt));
+        let u = e.full_snapshot_searched();
+        // Standalone "foo" at col 7; not the prefix of "foobar".
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
+        assert_ne!(u.lines[0].cell(7).flags & FLAG_MATCH_CURRENT, 0);
+    }
+
+    #[test]
+    fn search_case_sensitive_requires_exact_case() {
+        let mut e = engine(20, 5);
+        e.advance(b"Foo foo".to_vec());
+        let insensitive = SearchOptions {
+            case_sensitive: false,
+            ..SearchOptions::default()
+        };
+        assert!(e.search_set("foo".to_string(), insensitive));
+        let u = e.full_snapshot_searched();
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH, 0); // Foo
+        assert_ne!(u.lines[0].cell(4).flags & FLAG_MATCH, 0); // foo
+
+        let sensitive = SearchOptions {
+            case_sensitive: true,
+            ..SearchOptions::default()
+        };
+        assert!(e.search_set("foo".to_string(), sensitive));
+        let u = e.full_snapshot_searched();
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH, 0); // Foo excluded
+        assert_ne!(u.lines[0].cell(4).flags & FLAG_MATCH_CURRENT, 0);
+    }
+
+    #[test]
+    fn search_wrap_false_does_not_wrap_past_end() {
+        let mut e = engine(20, 5);
+        e.advance(b"foo\r\nbar\r\nfoo".to_vec());
+        let opt = SearchOptions {
+            wrap: false,
+            ..SearchOptions::default()
+        };
+        assert!(e.search_set("foo".to_string(), opt));
+        let u = e.full_snapshot_searched();
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+
+        assert!(e.search_next()); // second "foo" on line 2
+        let u = e.full_snapshot_searched();
+        assert_ne!(u.lines[2].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+
+        // No wrap back to the first hit.
+        assert!(!e.search_next());
+        let u = e.full_snapshot_searched();
+        assert_ne!(u.lines[2].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+        assert_eq!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
     }
 
     #[test]

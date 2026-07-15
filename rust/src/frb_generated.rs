@@ -1107,6 +1107,7 @@ fn wire__crate__api__terminal__engine_search_set_impl(
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<TerminalEngine>,
             >>::sse_decode(&mut deserializer);
             let api_pattern = <String>::sse_decode(&mut deserializer);
+            let api_options = <crate::engine::SearchOptions>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let mut api_engine_guard = None;
@@ -1128,6 +1129,7 @@ fn wire__crate__api__terminal__engine_search_set_impl(
                 let output_ok = Result::<_, ()>::Ok(crate::api::terminal::engine_search_set(
                     &mut *api_engine_guard,
                     api_pattern,
+                    api_options,
                 ))?;
                 Ok(output_ok)
             })())
@@ -1829,6 +1831,22 @@ impl SseDecode for crate::engine::RenderUpdate {
     }
 }
 
+impl SseDecode for crate::engine::SearchOptions {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_caseSensitive = <bool>::sse_decode(deserializer);
+        let mut var_wholeWord = <bool>::sse_decode(deserializer);
+        let mut var_regex = <bool>::sse_decode(deserializer);
+        let mut var_wrap = <bool>::sse_decode(deserializer);
+        return crate::engine::SearchOptions {
+            case_sensitive: var_caseSensitive,
+            whole_word: var_wholeWord,
+            regex: var_regex,
+            wrap: var_wrap,
+        };
+    }
+}
+
 impl SseDecode for u16 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2076,6 +2094,26 @@ impl flutter_rust_bridge::IntoIntoDart<crate::engine::RenderUpdate>
         self
     }
 }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::engine::SearchOptions {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.case_sensitive.into_into_dart().into_dart(),
+            self.whole_word.into_into_dart().into_dart(),
+            self.regex.into_into_dart().into_dart(),
+            self.wrap.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::engine::SearchOptions {}
+impl flutter_rust_bridge::IntoIntoDart<crate::engine::SearchOptions>
+    for crate::engine::SearchOptions
+{
+    fn into_into_dart(self) -> crate::engine::SearchOptions {
+        self
+    }
+}
 
 impl SseEncode for TerminalEngine {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -2265,6 +2303,16 @@ impl SseEncode for crate::engine::RenderUpdate {
         <u32>::sse_encode(self.cursor_color, serializer);
         <f64>::sse_encode(self.scroll_fraction, serializer);
         <i32>::sse_encode(self.scroll_line_delta, serializer);
+    }
+}
+
+impl SseEncode for crate::engine::SearchOptions {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.case_sensitive, serializer);
+        <bool>::sse_encode(self.whole_word, serializer);
+        <bool>::sse_encode(self.regex, serializer);
+        <bool>::sse_encode(self.wrap, serializer);
     }
 }
 
