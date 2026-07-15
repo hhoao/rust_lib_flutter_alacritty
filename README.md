@@ -15,6 +15,17 @@ instead.
 - `lib/precompiled_loader.dart` — download verified release binaries (tests)
 - Platform folders — Android, iOS, Linux, macOS, Windows plugin glue
 
+## Alacritty terminal dependency
+
+`rust/Cargo.toml` pins `alacritty_terminal` to an upstream git `rev`. For local
+Task 5/6 work (explicit Match Case via `RegexSearch::with_case_insensitive`),
+a `[patch]` points at a **machine-local absolute path** to a patched alacritty
+checkout (`feature/regex-search-case-flag`).
+
+That path override **must not ship**: it breaks CI and other machines. Before
+publish, replace it with a fork/`rev` that includes
+`RegexSearch::with_case_insensitive` (or drop the patch once upstream merges).
+
 ## Precompiled binaries
 
 Consumers without Rust download signed artifacts during `flutter build`. See
