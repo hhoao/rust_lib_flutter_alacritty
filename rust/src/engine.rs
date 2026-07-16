@@ -1290,10 +1290,10 @@ impl TerminalEngine {
     }
 
     pub fn take_damage(&mut self) -> RenderUpdate {
-        // A non-zero sub-cell offset must ride on a full snapshot so the overscan
-        // row and `scroll_fraction` are present. Partial damage (which ships only
-        // changed viewport rows) is therefore limited to the flush, live-edge case.
-        if self.term.grid().display_offset() > 0 || self.scroll_fraction != 0.0 {
+        // Partial `line_cells` uses absolute grid lines, so history views still
+        // need a full snapshot. Live-edge mid-cell (`scroll_fraction != 0`) can
+        // ride overscan + fraction on a partial / scroll_refresh-style payload.
+        if self.term.grid().display_offset() > 0 {
             return self.full_snapshot();
         }
         // Collect damaged viewport rows, then drop the borrow before reading cells.
@@ -1318,10 +1318,15 @@ impl TerminalEngine {
             Some(mut rows) => {
                 rows.sort_unstable();
                 rows.dedup();
-                let lines = rows
+                let mut lines: Vec<LineUpdate> = rows
                     .into_iter()
                     .map(|row| LineUpdate::from_cells(row as u32, self.line_cells(row)))
                     .collect();
+                // Mid-cell at live edge: ship overscan like scroll_refresh(0).
+                if self.scroll_fraction != 0.0 {
+                    let screen_rows = self.term.screen_lines();
+                    lines.push(self.overscan_line_update(screen_rows));
+                }
                 let (default_fg, default_bg, cursor_color) = self.chrome_colors();
                 RenderUpdate {
                     lines,
@@ -1337,7 +1342,7 @@ impl TerminalEngine {
                     default_fg,
                     default_bg,
                     cursor_color,
-                    scroll_fraction: 0.0,
+                    scroll_fraction: self.scroll_fraction,
                     scroll_line_delta: 0,
                 }
             }
@@ -2129,11 +2134,12 @@ mod tests {
         assert_eq!(u.display_offset, 1);
         assert!(u.scroll_fraction.abs() < 1e-9);
 
-        // Reverse half a cell: steps back down, fraction = 0.5 again.
+        // Reverse half a cell from offset 1 → pos 0.5, within one line of the
+        // live bottom, so edge-snap pins flush (see scroll_pixels_snaps_near_live_bottom).
         e.scroll_pixels(-9.0);
         let u = e.full_snapshot();
         assert_eq!(u.display_offset, 0);
-        assert!((u.scroll_fraction - 0.5).abs() < 1e-9);
+        assert_eq!(u.scroll_fraction, 0.0);
     }
 
     #[test]
@@ -2231,15 +2237,39 @@ mod tests {
     }
 
     #[test]
-    fn take_damage_forces_full_when_fraction_nonzero() {
+    fn take_damage_keeps_partial_when_fraction_nonzero_at_live_edge() {
+        // Live edge + mid-cell fraction: overscan + fraction ride on a partial
+        // (scroll_refresh-style) payload — not a full viewport dump.
         let mut e = engine(10, 3);
         fill_lines(&mut e, 12);
         e.set_cell_pixels(9, 18);
         e.take_damage(); // drain
         e.scroll_pixels(9.0); // fraction 0.5, still display_offset 0
         let u = e.take_damage();
-        assert!(u.full, "non-zero fraction must ride a full snapshot");
+        assert!(!u.full, "live-edge fraction must not force full snapshot");
+        assert_eq!(u.display_offset, 0);
         assert!((u.scroll_fraction - 0.5).abs() < 1e-9);
+        assert!(
+            u.lines.iter().any(|l| l.line == OVERSCAN_LINE_TAG),
+            "overscan must ride with fraction"
+        );
+        assert!(
+            u.lines.len() < e.term.screen_lines() + 1,
+            "expected edge/partial payload, got {} lines",
+            u.lines.len()
+        );
+    }
+
+    #[test]
+    fn take_damage_forces_full_when_scrolled_into_history() {
+        // Partial line_cells uses absolute grid lines; history views still need full.
+        let mut e = engine(10, 3);
+        fill_lines(&mut e, 12);
+        e.take_damage(); // drain
+        e.scroll_lines(2);
+        let u = e.take_damage();
+        assert!(u.full);
+        assert!(u.display_offset > 0);
     }
 
     #[test]
