@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::csi_mode_scan::{ColorSchemeToggle, CsiModeScanner};
+use crate::csi_mode_scan::{CsiModeEvent, CsiModeScanner};
 use crate::event_proxy::{
     ClipboardReplyQueue, EngineEvent, EventProxy, EventQueue, ReplyQueue, SizeReplyQueue,
 };
@@ -371,13 +371,16 @@ pub struct TerminalEngine {
     /// Sub-cell scroll accumulator in cell-height fractions, kept in [0.0, 1.0).
     /// See [`RenderUpdate::scroll_fraction`].
     scroll_fraction: f64,
-    /// Parallel sniffer for DEC private mode 2031 (color-scheme notifications),
-    /// which the pinned alacritty parser doesn't surface. See [`CsiModeScanner`].
-    color_scheme_scanner: CsiModeScanner,
+    /// Parallel sniffer for DEC private modes alacritty does not surface
+    /// (2031 color-scheme, 2026 synchronized output). See [`CsiModeScanner`].
+    csi_mode_scanner: CsiModeScanner,
     /// Whether the running program subscribed (mode 2031) to color-scheme
     /// change notifications. When set, [`reconfigure`](Self::reconfigure) pushes
     /// an OSC 997 report so a live theme toggle re-themes the TUI without a restart.
     color_scheme_subscribed: bool,
+    /// DEC 2026 synchronized output active. alacritty parses SyncUpdate as a
+    /// no-op (no `TermMode` bit); we track it here and OR into `mode_flags`.
+    synchronized_output_active: bool,
 }
 
 impl TerminalEngine {
@@ -421,9 +424,27 @@ impl TerminalEngine {
             hyperlinks: Vec::new(),
             hyperlink_ids: HashMap::new(),
             scroll_fraction: 0.0,
-            color_scheme_scanner: CsiModeScanner::new(),
+            csi_mode_scanner: CsiModeScanner::new(),
             color_scheme_subscribed: false,
+            synchronized_output_active: false,
         }
+    }
+
+    /// Library-owned synthetic bit (not from alacritty `TermMode`) — matches
+    /// Dart `kModeSynchronizedOutput` (`1 << 23`).
+    pub const MODE_SYNCHRONIZED_OUTPUT: u32 = 1 << 23;
+
+    /// Whether DEC 2026 synchronized output is currently active.
+    pub fn synchronized_output_active(&self) -> bool {
+        self.synchronized_output_active
+    }
+
+    fn packed_mode_flags(&self) -> u32 {
+        let mut flags = self.term.mode().bits();
+        if self.synchronized_output_active {
+            flags |= Self::MODE_SYNCHRONIZED_OUTPUT;
+        }
+        flags
     }
 
     pub fn take_events(&self) -> Vec<EngineEvent> {
@@ -453,10 +474,10 @@ impl TerminalEngine {
     }
 
     pub fn advance(&mut self, bytes: Vec<u8>) {
-        // Sniff mode-2031 toggles from the raw stream (alacritty hides them). Use
-        // the original bytes — OSC pre-filtering can splice the stream, but it
-        // only touches `ESC ]` sequences, never the `ESC [` CSI we look for.
-        let toggles = self.color_scheme_scanner.feed(&bytes);
+        // Sniff modes alacritty does not surface (2031 / 2026). Use the original
+        // bytes — OSC pre-filtering can splice the stream, but it only touches
+        // `ESC ]` sequences, never the `ESC [` CSI we look for.
+        let toggles = self.csi_mode_scanner.feed(&bytes);
         let (filtered, osc_events) = extract_osc_events(&bytes);
         for e in osc_events {
             self.events.lock().unwrap().push(e);
@@ -465,12 +486,14 @@ impl TerminalEngine {
         self.resolve_pending_replies();
         for toggle in toggles {
             match toggle {
-                ColorSchemeToggle::Subscribe => {
+                CsiModeEvent::ColorSchemeSubscribe => {
                     self.color_scheme_subscribed = true;
                     // Per the protocol, answer the subscribe with the current scheme.
                     self.emit_color_scheme_report();
                 }
-                ColorSchemeToggle::Unsubscribe => self.color_scheme_subscribed = false,
+                CsiModeEvent::ColorSchemeUnsubscribe => self.color_scheme_subscribed = false,
+                CsiModeEvent::SyncUpdateSet => self.synchronized_output_active = true,
+                CsiModeEvent::SyncUpdateReset => self.synchronized_output_active = false,
             }
         }
     }
@@ -1071,7 +1094,7 @@ impl TerminalEngine {
             cursor_visible: cursor_visible && display_offset == 0,
             cursor_shape,
             cursor_blinking,
-            mode_flags: self.term.mode().bits(),
+            mode_flags: self.packed_mode_flags(),
             display_offset: display_offset as u32,
             history_size: self.history_size_u32(),
             default_fg,
@@ -1255,7 +1278,7 @@ impl TerminalEngine {
             cursor_visible: cursor_visible && display_offset == 0,
             cursor_shape,
             cursor_blinking,
-            mode_flags: self.term.mode().bits(),
+            mode_flags: self.packed_mode_flags(),
             display_offset: display_offset as u32,
             history_size: self.history_size_u32(),
             default_fg,
@@ -1308,7 +1331,7 @@ impl TerminalEngine {
                     cursor_visible,
                     cursor_shape,
                     cursor_blinking,
-                    mode_flags: self.term.mode().bits(),
+                    mode_flags: self.packed_mode_flags(),
                     display_offset: 0,
                     history_size: self.history_size_u32(),
                     default_fg,
@@ -1608,6 +1631,41 @@ mod tests {
         assert_ne!(e.full_snapshot().mode_flags & (1 << 4), 0);
         e.advance(b"\x1b[?1l".to_vec()); // reset DECCKM
         assert_eq!(e.full_snapshot().mode_flags & (1 << 1), 0);
+    }
+
+    #[test]
+    fn mode_flags_pack_synchronized_output() {
+        let mut e = engine(20, 5);
+        assert!(!e.synchronized_output_active());
+        assert_eq!(
+            e.full_snapshot().mode_flags & TerminalEngine::MODE_SYNCHRONIZED_OUTPUT,
+            0
+        );
+
+        e.advance(b"\x1b[?2026h".to_vec());
+        assert!(e.synchronized_output_active());
+        assert_ne!(
+            e.full_snapshot().mode_flags & TerminalEngine::MODE_SYNCHRONIZED_OUTPUT,
+            0
+        );
+
+        e.advance(b"partial\x1b[?2026l".to_vec());
+        assert!(!e.synchronized_output_active());
+        assert_eq!(
+            e.full_snapshot().mode_flags & TerminalEngine::MODE_SYNCHRONIZED_OUTPUT,
+            0
+        );
+    }
+
+    #[test]
+    fn synchronized_output_split_across_advances() {
+        let mut e = engine(20, 5);
+        e.advance(b"\x1b[?20".to_vec());
+        assert!(!e.synchronized_output_active());
+        e.advance(b"26h".to_vec());
+        assert!(e.synchronized_output_active());
+        e.advance(b"\x1b[?2026l".to_vec());
+        assert!(!e.synchronized_output_active());
     }
 
     #[test]

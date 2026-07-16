@@ -1,43 +1,56 @@
-//! Incremental sniffer for the one DEC private mode the vendored alacritty
-//! parser hides from us: mode **2031**, the color-scheme change-notification
-//! protocol (contour/ghostty/iTerm2, a.k.a. "light/dark mode reporting").
+//! Incremental sniffer for DEC private modes the vendored alacritty parser
+//! does not surface to us:
+//!
+//! | Mode | Why sniff |
+//! |------|-----------|
+//! | **2031** | Color-scheme notifications — pinned alacritty predates / ignores it |
+//! | **2026** | Synchronized output (`SyncUpdate`) — parsed as a **no-op** (no `TermMode` bit) |
 //!
 //! ## Why a parallel scanner
 //!
-//! alacritty's vte parser silently swallows private modes it doesn't recognize
-//! and exposes no hook for us to observe them, and the revision we pin predates
-//! mode 2031. So we sniff the raw PTY byte stream in parallel with the parser.
+//! alacritty's vte parser either swallows unrecognized private modes or, for
+//! SyncUpdate, handles them with an empty body and exposes no `EventListener`
+//! hook / mode flag. We sniff the raw PTY byte stream in parallel with
+//! `parser.advance`.
 //!
 //! The scanner is **observe-only**: it never removes or rewrites bytes (the same
-//! bytes still flow to alacritty, which harmlessly ignores the unknown mode),
-//! and it carries partial state across [`CsiModeScanner::feed`] calls so a
-//! sequence split across two PTY reads — `ESC [ ?` in one chunk, `2031 h` in the
-//! next — is still recognized.
+//! bytes still flow to alacritty), and it carries partial state across
+//! [`CsiModeScanner::feed`] calls so a sequence split across two PTY reads —
+//! `ESC [ ?` in one chunk, `2026 h` in the next — is still recognized.
 //!
 //! ## Recognized sequences
 //!
-//! | Sequence | Toggle |
+//! | Sequence | Event |
 //! |----------|--------|
-//! | `CSI ? 2031 h` (`ESC [ ? 2031 h`) | [`ColorSchemeToggle::Subscribe`] |
-//! | `CSI ? 2031 l` | [`ColorSchemeToggle::Unsubscribe`] |
+//! | `CSI ? 2031 h` | [`CsiModeEvent::ColorSchemeSubscribe`] |
+//! | `CSI ? 2031 l` | [`CsiModeEvent::ColorSchemeUnsubscribe`] |
+//! | `CSI ? 2026 h` | [`CsiModeEvent::SyncUpdateSet`] |
+//! | `CSI ? 2026 l` | [`CsiModeEvent::SyncUpdateReset`] |
 //!
-//! `2031` may appear among other `;`-separated params (e.g. `CSI ? 1049;2031 h`).
-
-/// A recognized toggle of DEC private mode 2031.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorSchemeToggle {
-    /// `CSI ? 2031 h` — application wants color-scheme change notifications.
-    Subscribe,
-    /// `CSI ? 2031 l` — application no longer wants them.
-    Unsubscribe,
-}
+//! Modes may appear among other `;`-separated params (e.g. `CSI ? 1049;2026 h`).
 
 /// DEC private mode number for color-scheme update notifications.
 const COLOR_SCHEME_MODE: &str = "2031";
 
+/// DEC private mode number for synchronized output (CSI SyncUpdate).
+const SYNC_UPDATE_MODE: &str = "2026";
+
 /// Cap on accumulated CSI parameter bytes. Real mode sequences are short, so a
 /// runaway means we mis-synced on binary data — abort rather than grow forever.
 const MAX_PARAMS_LEN: usize = 64;
+
+/// A recognized DEC private-mode toggle from the parallel CSI sniffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsiModeEvent {
+    /// `CSI ? 2031 h` — application wants color-scheme change notifications.
+    ColorSchemeSubscribe,
+    /// `CSI ? 2031 l` — application no longer wants them.
+    ColorSchemeUnsubscribe,
+    /// `CSI ? 2026 h` — synchronized output / present-hold begin.
+    SyncUpdateSet,
+    /// `CSI ? 2026 l` — synchronized output end; safe to present.
+    SyncUpdateReset,
+}
 
 #[derive(Default, Clone, Copy)]
 enum State {
@@ -52,7 +65,7 @@ enum State {
     CsiPriv,
 }
 
-/// Stateful, observe-only sniffer for mode-2031 toggles. Construct once per
+/// Stateful, observe-only sniffer for modes 2031 and 2026. Construct once per
 /// engine and [`feed`](Self::feed) every chunk of raw PTY output.
 #[derive(Default)]
 pub struct CsiModeScanner {
@@ -65,10 +78,10 @@ impl CsiModeScanner {
         Self::default()
     }
 
-    /// Feed one chunk of raw PTY output. Returns any mode-2031 toggles found, in
+    /// Feed one chunk of raw PTY output. Returns any recognized toggles found, in
     /// stream order. The bytes are neither consumed nor modified — the caller
     /// still hands the identical bytes to the real parser.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<ColorSchemeToggle> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<CsiModeEvent> {
         let mut out = Vec::new();
         for &b in bytes {
             match self.state {
@@ -102,12 +115,21 @@ impl CsiModeScanner {
                         }
                     }
                     b'h' | b'l' => {
-                        if self.has_color_scheme_mode() {
-                            out.push(if b == b'h' {
-                                ColorSchemeToggle::Subscribe
-                            } else {
-                                ColorSchemeToggle::Unsubscribe
-                            });
+                        let set = b == b'h';
+                        for p in self.params.split(';') {
+                            if p == COLOR_SCHEME_MODE {
+                                out.push(if set {
+                                    CsiModeEvent::ColorSchemeSubscribe
+                                } else {
+                                    CsiModeEvent::ColorSchemeUnsubscribe
+                                });
+                            } else if p == SYNC_UPDATE_MODE {
+                                out.push(if set {
+                                    CsiModeEvent::SyncUpdateSet
+                                } else {
+                                    CsiModeEvent::SyncUpdateReset
+                                });
+                            }
                         }
                         self.reset();
                     }
@@ -123,10 +145,6 @@ impl CsiModeScanner {
         out
     }
 
-    fn has_color_scheme_mode(&self) -> bool {
-        self.params.split(';').any(|p| p == COLOR_SCHEME_MODE)
-    }
-
     fn reset(&mut self) {
         self.state = State::Ground;
         self.params.clear();
@@ -136,44 +154,62 @@ impl CsiModeScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ColorSchemeToggle::*;
+    use CsiModeEvent::*;
 
-    fn scan(bytes: &[u8]) -> Vec<ColorSchemeToggle> {
+    fn scan(bytes: &[u8]) -> Vec<CsiModeEvent> {
         CsiModeScanner::new().feed(bytes)
     }
 
     #[test]
     fn subscribe_sequence() {
-        assert_eq!(scan(b"\x1b[?2031h"), vec![Subscribe]);
+        assert_eq!(scan(b"\x1b[?2031h"), vec![ColorSchemeSubscribe]);
     }
 
     #[test]
     fn unsubscribe_sequence() {
-        assert_eq!(scan(b"\x1b[?2031l"), vec![Unsubscribe]);
+        assert_eq!(scan(b"\x1b[?2031l"), vec![ColorSchemeUnsubscribe]);
+    }
+
+    #[test]
+    fn sync_update_set_and_reset() {
+        assert_eq!(scan(b"\x1b[?2026h"), vec![SyncUpdateSet]);
+        assert_eq!(scan(b"\x1b[?2026l"), vec![SyncUpdateReset]);
     }
 
     #[test]
     fn surrounded_by_text() {
-        assert_eq!(scan(b"before\x1b[?2031hafter"), vec![Subscribe]);
+        assert_eq!(scan(b"before\x1b[?2031hafter"), vec![ColorSchemeSubscribe]);
+        assert_eq!(scan(b"before\x1b[?2026hafter"), vec![SyncUpdateSet]);
     }
 
     #[test]
     fn ignores_other_private_modes() {
-        // Bracketed paste + alt screen must not be mistaken for 2031.
+        // Bracketed paste + alt screen must not be mistaken for 2031/2026.
         assert!(scan(b"\x1b[?2004h\x1b[?1049h").is_empty());
     }
 
     #[test]
-    fn mode_2031_among_other_params() {
-        assert_eq!(scan(b"\x1b[?1049;2031h"), vec![Subscribe]);
-        assert_eq!(scan(b"\x1b[?2031;1004l"), vec![Unsubscribe]);
+    fn mode_among_other_params() {
+        assert_eq!(scan(b"\x1b[?1049;2031h"), vec![ColorSchemeSubscribe]);
+        assert_eq!(scan(b"\x1b[?2031;1004l"), vec![ColorSchemeUnsubscribe]);
+        assert_eq!(scan(b"\x1b[?1049;2026h"), vec![SyncUpdateSet]);
+        assert_eq!(scan(b"\x1b[?2026;1004l"), vec![SyncUpdateReset]);
+    }
+
+    #[test]
+    fn both_modes_in_one_sequence() {
+        assert_eq!(
+            scan(b"\x1b[?2026;2031h"),
+            vec![SyncUpdateSet, ColorSchemeSubscribe]
+        );
     }
 
     #[test]
     fn substring_param_does_not_match() {
-        // "12031" / "20310" must not be read as 2031.
         assert!(scan(b"\x1b[?12031h").is_empty());
         assert!(scan(b"\x1b[?20310h").is_empty());
+        assert!(scan(b"\x1b[?12026h").is_empty());
+        assert!(scan(b"\x1b[?20260h").is_empty());
     }
 
     #[test]
@@ -181,7 +217,12 @@ mod tests {
         let mut s = CsiModeScanner::new();
         assert!(s.feed(b"\x1b[?20").is_empty());
         assert!(s.feed(b"31").is_empty());
-        assert_eq!(s.feed(b"h"), vec![Subscribe]);
+        assert_eq!(s.feed(b"h"), vec![ColorSchemeSubscribe]);
+
+        let mut s2 = CsiModeScanner::new();
+        assert!(s2.feed(b"\x1b[?20").is_empty());
+        assert!(s2.feed(b"26").is_empty());
+        assert_eq!(s2.feed(b"h"), vec![SyncUpdateSet]);
     }
 
     #[test]
@@ -189,20 +230,28 @@ mod tests {
         let mut s = CsiModeScanner::new();
         assert!(s.feed(b"\x1b").is_empty());
         assert!(s.feed(b"[?2031").is_empty());
-        assert_eq!(s.feed(b"l"), vec![Unsubscribe]);
+        assert_eq!(s.feed(b"l"), vec![ColorSchemeUnsubscribe]);
     }
 
     #[test]
     fn aborted_by_new_escape() {
-        // ESC mid-params abandons the first attempt, then a clean sequence wins.
-        assert_eq!(scan(b"\x1b[?20\x1b[?2031h"), vec![Subscribe]);
+        assert_eq!(scan(b"\x1b[?20\x1b[?2031h"), vec![ColorSchemeSubscribe]);
+        assert_eq!(scan(b"\x1b[?20\x1b[?2026h"), vec![SyncUpdateSet]);
     }
 
     #[test]
     fn multiple_toggles_in_order() {
         assert_eq!(
             scan(b"\x1b[?2031h\x1b[?2031l\x1b[?2031h"),
-            vec![Subscribe, Unsubscribe, Subscribe]
+            vec![
+                ColorSchemeSubscribe,
+                ColorSchemeUnsubscribe,
+                ColorSchemeSubscribe
+            ]
+        );
+        assert_eq!(
+            scan(b"\x1b[?2026h\x1b[?2026l\x1b[?2026h"),
+            vec![SyncUpdateSet, SyncUpdateReset, SyncUpdateSet]
         );
     }
 
@@ -216,7 +265,6 @@ mod tests {
 
     #[test]
     fn plain_csi_without_question_mark_ignored() {
-        // SGR and a non-private CSI must never enter the params accumulator.
-        assert!(scan(b"\x1b[2031h\x1b[31m").is_empty());
+        assert!(scan(b"\x1b[2031h\x1b[31m\x1b[2026h").is_empty());
     }
 }
