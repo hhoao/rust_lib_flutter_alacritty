@@ -5,3 +5,4 @@ pub mod view_frame;
 mod event_proxy;
 mod frb_generated;
 pub mod osc_preparse;
+pub mod terminal_raster_present;

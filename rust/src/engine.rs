@@ -6,6 +6,7 @@ use crate::event_proxy::{
     ClipboardReplyQueue, EngineEvent, EventProxy, EventQueue, ReplyQueue, SizeReplyQueue,
 };
 use crate::osc_preparse::extract_osc_events;
+use crate::terminal_raster_present::{RasterChrome, RasterPresentFrame, TerminalRasterPresent};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -381,6 +382,9 @@ pub struct TerminalEngine {
     /// DEC 2026 synchronized output active. alacritty parses SyncUpdate as a
     /// no-op (no `TermMode` bit); we track it here and OR into `mode_flags`.
     synchronized_output_active: bool,
+    /// Retained RGBA pixmap for the Rust-raster present path (Dart uploads to
+    /// `ui.Image`). `None` until the first [`Self::take_raster_present`].
+    raster: Option<TerminalRasterPresent>,
 }
 
 impl TerminalEngine {
@@ -427,6 +431,7 @@ impl TerminalEngine {
             csi_mode_scanner: CsiModeScanner::new(),
             color_scheme_subscribed: false,
             synchronized_output_active: false,
+            raster: None,
         }
     }
 
@@ -1348,6 +1353,73 @@ impl TerminalEngine {
             }
         };
         u
+    }
+
+    /// Consume damage like [`Self::take_damage`], rasterize into a retained RGBA
+    /// pixmap, and return chrome + pixels (no columnar `LineUpdate` payload).
+    ///
+    /// Used by the Dart Rust-raster present path so MirrorGrid can apply
+    /// chrome-only updates while selection/search still call full snapshots.
+    pub fn take_raster_present(&mut self) -> RasterPresentFrame {
+        let update = self.take_damage();
+        self.apply_render_to_raster(&update)
+    }
+
+    /// Full viewport raster (resize / explicit refresh).
+    pub fn full_raster_present(&mut self) -> RasterPresentFrame {
+        let update = self.full_snapshot();
+        self.apply_render_to_raster(&update)
+    }
+
+    /// Rasterize a [`RenderUpdate`] already produced by scroll/snapshot helpers.
+    pub fn rasterize_update(&mut self, update: &RenderUpdate) -> RasterPresentFrame {
+        self.apply_render_to_raster(update)
+    }
+
+    fn apply_render_to_raster(&mut self, update: &RenderUpdate) -> RasterPresentFrame {
+        let cols = self.term.columns().max(MIN_COLUMNS) as u16;
+        let rows = self.term.screen_lines().max(MIN_SCREEN_LINES) as u16;
+        let cell_w = self.cell_w.max(1);
+        let cell_h = self.cell_h.max(1);
+        let need_new = match &self.raster {
+            None => true,
+            Some(r) => {
+                r.width() != cols as u32 * cell_w as u32
+                    || r.height() != rows as u32 * cell_h as u32
+            }
+        };
+        if need_new {
+            let mut buf = TerminalRasterPresent::new(cols, rows, cell_w, cell_h);
+            buf.clear(update.default_bg);
+            self.raster = Some(buf);
+        }
+        let raster = self.raster.as_mut().expect("raster just ensured");
+        if update.full || need_new {
+            raster.clear(update.default_bg);
+        } else if update.scroll_line_delta != 0 {
+            raster.rotate_rows(update.scroll_line_delta);
+        }
+        for line in &update.lines {
+            if line.line == OVERSCAN_LINE_TAG {
+                continue;
+            }
+            raster.blit_line(line);
+        }
+        let chrome = RasterChrome {
+            cursor_line: update.cursor_line,
+            cursor_col: update.cursor_col,
+            cursor_visible: update.cursor_visible,
+            cursor_shape: update.cursor_shape,
+            cursor_blinking: update.cursor_blinking,
+            mode_flags: update.mode_flags,
+            display_offset: update.display_offset,
+            history_size: update.history_size,
+            scroll_fraction: update.scroll_fraction,
+            default_fg: update.default_fg,
+            default_bg: update.default_bg,
+            cursor_color: update.cursor_color,
+        };
+        raster.into_frame(chrome, update.full || need_new)
     }
 }
 
@@ -2361,5 +2433,23 @@ mod tests {
         fill_lines(&mut e, 8);
         let u = e.full_snapshot();
         assert_eq!(u.history_size as usize, e.term.grid().history_size());
+    }
+
+    #[test]
+    fn take_raster_present_returns_rgba_without_needing_line_mirror() {
+        let mut e = engine(8, 2);
+        e.set_cell_pixels(6, 8);
+        e.advance(b"Hi".to_vec());
+        let frame = e.take_raster_present();
+        assert_eq!(frame.width, 8 * 6);
+        assert_eq!(frame.height, 2 * 8);
+        assert_eq!(frame.rgba.len(), (frame.width * frame.height * 4) as usize);
+        // At least one non-bg pixel from the 'H'/'i' glyphs.
+        let bg = frame.default_bg;
+        let bg_r = ((bg >> 16) & 0xFF) as u8;
+        let bg_g = ((bg >> 8) & 0xFF) as u8;
+        let bg_b = (bg & 0xFF) as u8;
+        let saw = frame.rgba.chunks_exact(4).any(|p| p[0] != bg_r || p[1] != bg_g || p[2] != bg_b);
+        assert!(saw, "expected glyph pixels distinct from default bg");
     }
 }

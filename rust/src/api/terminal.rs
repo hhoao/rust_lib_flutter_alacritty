@@ -1,5 +1,6 @@
 pub use crate::engine::{CellData, EngineConfig, LineUpdate, RenderUpdate, SearchOptions, TerminalEngine};
 pub use crate::event_proxy::EngineEvent;
+pub use crate::terminal_raster_present::RasterPresentFrame;
 
 use flutter_rust_bridge::frb;
 use std::panic::AssertUnwindSafe;
@@ -285,5 +286,128 @@ pub fn engine_set_cell_pixels(engine: &mut TerminalEngine, width: u16, height: u
 #[frb(sync)]
 pub fn engine_reconfigure(engine: &mut TerminalEngine, config: EngineConfig) {
     engine.reconfigure(config);
+}
+
+/// Rust-raster present: consume damage and return RGBA + chrome (no LineUpdate
+/// mirror payload). Dart uploads `rgba` to a retained `ui.Image`.
+#[frb(sync)]
+pub fn engine_take_raster_present(engine: &mut TerminalEngine) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.take_raster_present())).unwrap_or_else(
+        |_| {
+            eprintln!("flutter_alacritty: engine_take_raster_present panicked");
+            empty_raster_frame()
+        },
+    )
+}
+
+/// Full viewport Rust-raster present (resize / explicit refresh).
+#[frb(sync)]
+pub fn engine_full_raster_present(engine: &mut TerminalEngine) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| engine.full_raster_present())).unwrap_or_else(
+        |_| {
+            eprintln!("flutter_alacritty: engine_full_raster_present panicked");
+            empty_raster_frame()
+        },
+    )
+}
+
+/// Single FFI round-trip: parse PTY bytes then raster-present.
+pub async fn engine_advance_and_take_raster_present(
+    engine: &mut TerminalEngine,
+    bytes: Vec<u8>,
+) -> RasterPresentFrame {
+    if std::panic::catch_unwind(AssertUnwindSafe(|| engine.advance(bytes))).is_err() {
+        eprintln!(
+            "flutter_alacritty: engine_advance_and_take_raster_present advance panicked"
+        );
+    }
+    engine_take_raster_present(engine)
+}
+
+pub async fn engine_scroll_lines_raster(
+    engine: &mut TerminalEngine,
+    delta: i32,
+) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let u = engine.scroll_lines(delta);
+        engine.rasterize_update(&u)
+    }))
+    .unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_lines_raster panicked");
+        empty_raster_frame()
+    })
+}
+
+pub async fn engine_scroll_pixels_raster(
+    engine: &mut TerminalEngine,
+    delta_px: f64,
+) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let u = engine.scroll_pixels(delta_px);
+        engine.rasterize_update(&u)
+    }))
+    .unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_pixels_raster panicked");
+        empty_raster_frame()
+    })
+}
+
+pub async fn engine_scroll_to_bottom_raster(
+    engine: &mut TerminalEngine,
+) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let u = engine.scroll_to_bottom();
+        engine.rasterize_update(&u)
+    }))
+    .unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_to_bottom_raster panicked");
+        empty_raster_frame()
+    })
+}
+
+pub async fn engine_scroll_to_top_raster(engine: &mut TerminalEngine) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let u = engine.scroll_to_top();
+        engine.rasterize_update(&u)
+    }))
+    .unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_to_top_raster panicked");
+        empty_raster_frame()
+    })
+}
+
+pub async fn engine_scroll_to_offset_raster(
+    engine: &mut TerminalEngine,
+    offset_lines: f64,
+) -> RasterPresentFrame {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let u = engine.scroll_to_offset(offset_lines);
+        engine.rasterize_update(&u)
+    }))
+    .unwrap_or_else(|_| {
+        eprintln!("flutter_alacritty: engine_scroll_to_offset_raster panicked");
+        empty_raster_frame()
+    })
+}
+
+fn empty_raster_frame() -> RasterPresentFrame {
+    RasterPresentFrame {
+        width: 1,
+        height: 1,
+        rgba: vec![0, 0, 0, 255],
+        cursor_line: 0,
+        cursor_col: 0,
+        cursor_visible: false,
+        cursor_shape: 0,
+        cursor_blinking: false,
+        mode_flags: 0,
+        display_offset: 0,
+        history_size: 0,
+        scroll_fraction: 0.0,
+        default_fg: crate::engine::EngineConfig::default_palette()[16],
+        default_bg: crate::engine::EngineConfig::default_palette()[17],
+        cursor_color: crate::engine::CURSOR_COLOR_UNSET,
+        full: true,
+    }
 }
 
