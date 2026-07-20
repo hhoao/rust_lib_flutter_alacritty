@@ -844,16 +844,6 @@ impl TerminalEngine {
         update
     }
 
-    /// Cells of a single viewport row.
-    fn line_cells(&mut self, row: usize) -> Vec<CellData> {
-        let grid = self.term.grid();
-        let cols = grid.columns();
-        let cells_ref: Vec<Cell> = (0..cols)
-            .map(|c| grid[Line(row as i32)][Column(c)].clone())
-            .collect();
-        cells_ref.iter().map(|c| self.cell_data(c)).collect()
-    }
-
     fn ansi16(&self, i: u8) -> u32 {
         self.live(i as usize, self.palette[i as usize])
     }
@@ -1295,11 +1285,22 @@ impl TerminalEngine {
     }
 
     pub fn take_damage(&mut self) -> RenderUpdate {
-        // Partial `line_cells` uses absolute grid lines, so history views still
-        // need a full snapshot. Live-edge mid-cell (`scroll_fraction != 0`) can
-        // ride overscan + fraction on a partial / scroll_refresh-style payload.
+        // Partial packs use viewport rows; history views still need a full snapshot.
+        // Live-edge mid-cell (`scroll_fraction != 0`) can ride overscan + fraction
+        // on a partial / scroll_refresh-style payload.
         if self.term.grid().display_offset() > 0 {
-            return self.full_snapshot();
+            self.term.reset_damage();
+            return if self.search.is_some() {
+                self.full_snapshot_searched()
+            } else {
+                self.full_snapshot()
+            };
+        }
+        // Why: partial line packs omit search match flags; retain would keep
+        // stale highlights on clean rows. Match after_scroll_refresh.
+        if self.search.is_some() {
+            self.term.reset_damage();
+            return self.full_snapshot_searched();
         }
         // Collect damaged viewport rows, then drop the borrow before reading cells.
         let damaged: Option<Vec<usize>> = match self.term.damage() {
@@ -1323,9 +1324,10 @@ impl TerminalEngine {
             Some(mut rows) => {
                 rows.sort_unstable();
                 rows.dedup();
+                // pack_viewport_line ORs FLAG_SELECTED (line_cells did not).
                 let mut lines: Vec<LineUpdate> = rows
                     .into_iter()
-                    .map(|row| LineUpdate::from_cells(row as u32, self.line_cells(row)))
+                    .map(|row| self.pack_viewport_line(row))
                     .collect();
                 // Mid-cell at live edge: ship overscan like scroll_refresh(0).
                 if self.scroll_fraction != 0.0 {
@@ -2333,8 +2335,42 @@ mod tests {
     }
 
     #[test]
+    fn take_damage_partial_preserves_selection_flags() {
+        let mut e = engine(20, 3);
+        e.advance(b"hello world".to_vec());
+        e.take_damage(); // drain
+        e.selection_start(0, 0, false, 0);
+        e.selection_update(0, 4, true);
+        // Further input damages the line while selection is still active.
+        e.advance(b"!".to_vec());
+        let u = e.take_damage();
+        assert!(!u.full, "live-edge typing should stay partial");
+        let row0 = u
+            .lines
+            .iter()
+            .find(|l| l.line == 0)
+            .expect("damaged viewport row 0");
+        assert_ne!(row0.cell(0).flags & FLAG_SELECTED, 0);
+        assert_ne!(row0.cell(4).flags & FLAG_SELECTED, 0);
+    }
+
+    #[test]
+    fn take_damage_with_search_active_returns_searched_full() {
+        let mut e = engine(20, 5);
+        e.advance(b"foo bar foo".to_vec());
+        e.take_damage(); // drain
+        assert!(e.search_set("foo".to_string(), SearchOptions::default()));
+        e.advance(b"z".to_vec());
+        let u = e.take_damage();
+        assert!(u.full, "search-active damage must full_snapshot_searched");
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH, 0);
+        assert_ne!(u.lines[0].cell(0).flags & FLAG_MATCH_CURRENT, 0);
+    }
+
+    #[test]
     fn take_damage_forces_full_when_scrolled_into_history() {
-        // Partial line_cells uses absolute grid lines; history views still need full.
+        // Partial packs use absolute/viewport rows at live edge; history views
+        // still need a full snapshot.
         let mut e = engine(10, 3);
         fill_lines(&mut e, 12);
         e.take_damage(); // drain
