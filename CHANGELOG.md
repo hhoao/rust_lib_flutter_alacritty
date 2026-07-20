@@ -1,3 +1,12 @@
+## 0.2.2
+
+- Pin `alacritty_terminal` to fork rev with
+  `RegexSearch::with_case_insensitive` (no local path patch).
+- Search options FFI (case / whole word / regex / wrap).
+- DEC 2026 synchronized-output mode bit tracking.
+- Tighter `scroll_fraction` damage; Rust-raster present path;
+  preserve selection/search flags on partial `take_damage`.
+
 ## 0.2.1
 
 - Add Cargokit precompiled-binary support (`rust/cargokit.yaml`).

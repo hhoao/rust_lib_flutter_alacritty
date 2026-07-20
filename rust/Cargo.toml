@@ -8,18 +8,10 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 flutter_rust_bridge = "=2.12.0"
-# Pinned to a specific upstream commit for reproducible builds on any machine
-# (no reliance on a local checkout or an untracked symlink). Bump `rev` to move
-# the engine forward. To hack on alacritty locally, uncomment the [patch] below.
-alacritty_terminal = { git = "https://github.com/alacritty/alacritty.git", rev = "55f12aae2930b48d8727ae49ea1e472af16a9247" }
+# Fork pin: RegexSearch::with_case_insensitive (until upstream merges).
+# Bump `rev` to move the engine forward. To hack locally, add a [patch] path.
+alacritty_terminal = { git = "https://github.com/hhoao/alacritty.git", rev = "e6cf18ffcd099aa6118da35ea2476a50d54bd3b2" }
 regex-syntax = "0.8"
-
-# TEMPORARY local override for T0 correctness (Task 5/6): needs
-# RegexSearch::with_case_insensitive from feature/regex-search-case-flag.
-# Absolute path — breaks CI / other machines. Replace with a fork `rev`
-# (or upstream once merged) before publish. See README.
-[patch."https://github.com/alacritty/alacritty.git"]
-alacritty_terminal = { path = "/home/hhoa/git/opensource/alacritty/alacritty_terminal" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

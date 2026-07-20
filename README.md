@@ -17,14 +17,11 @@ instead.
 
 ## Alacritty terminal dependency
 
-`rust/Cargo.toml` pins `alacritty_terminal` to an upstream git `rev`. For local
-Task 5/6 work (explicit Match Case via `RegexSearch::with_case_insensitive`),
-a `[patch]` points at a **machine-local absolute path** to a patched alacritty
-checkout (`feature/regex-search-case-flag`).
-
-That path override **must not ship**: it breaks CI and other machines. Before
-publish, replace it with a fork/`rev` that includes
-`RegexSearch::with_case_insensitive` (or drop the patch once upstream merges).
+`rust/Cargo.toml` pins `alacritty_terminal` to
+[hhoao/alacritty](https://github.com/hhoao/alacritty) at a `rev` that includes
+`RegexSearch::with_case_insensitive`. Switch back to upstream once that API
+merges. For local hacks, add a temporary `[patch]` path override (do not
+commit it).
 
 ## Precompiled binaries
 
