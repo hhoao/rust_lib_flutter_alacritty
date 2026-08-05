@@ -5,6 +5,8 @@ pub fn greet(name: String) -> String {
 
 #[flutter_rust_bridge::frb(init)]
 pub fn init_app() {
-    // Default utilities - feel free to customize
-    flutter_rust_bridge::setup_default_user_utils();
+    // Do not use setup_default_user_utils(): it sets Trace and floods Android
+    // logcat with alacritty_terminal per-CSI traces during CLI TUI redraws.
+    flutter_rust_bridge::setup_log_to_console(log::LevelFilter::Warn);
+    flutter_rust_bridge::setup_backtrace();
 }

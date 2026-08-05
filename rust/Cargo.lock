@@ -716,6 +716,7 @@ version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "flutter_rust_bridge",
+ "log",
  "regex-syntax",
 ]
 

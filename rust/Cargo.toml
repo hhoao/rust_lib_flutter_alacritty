@@ -11,6 +11,7 @@ flutter_rust_bridge = "=2.12.0"
 # Fork pin: RegexSearch::with_case_insensitive (until upstream merges).
 # Bump `rev` to move the engine forward. To hack locally, add a [patch] path.
 alacritty_terminal = { git = "https://github.com/hhoao/alacritty.git", rev = "e6cf18ffcd099aa6118da35ea2476a50d54bd3b2" }
+log = "0.4"
 regex-syntax = "0.8"
 
 [lints.rust]
