@@ -677,6 +677,14 @@ impl TerminalEngine {
         self.term.clear_screen(ClearMode::Saved);
     }
 
+    pub fn clear_terminal(&mut self) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        self.term.clear_screen(ClearMode::Saved);
+        self.term.clear_screen(ClearMode::All);
+        // `ClearMode::All` rotates cleared viewport lines into scrollback.
+        self.term.clear_screen(ClearMode::Saved);
+    }
+
     pub fn set_palette(&mut self, palette: Vec<u32>) {
         if let Ok(p) = palette.try_into() {
             self.palette = p;
@@ -2124,6 +2132,43 @@ mod tests {
         let after = e.full_snapshot().display_offset;
         assert_eq!(after, 0);
         assert!(before >= after);
+    }
+
+    #[test]
+    fn clear_terminal_drops_scrollback_and_viewport() {
+        let mut e = TerminalEngine::new(10, 2, EngineConfig::defaults());
+        e.advance(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n".to_vec());
+        e.scroll_lines(100);
+        let before = e.full_snapshot();
+        assert!(before.display_offset > 0 || before.history_size > 0);
+        let filled = before
+            .lines
+            .iter()
+            .any(|l| (0..l.len()).any(|c| l.cell(c).codepoint == b'a' as u32
+                || l.cell(c).codepoint == b'b' as u32
+                || l.cell(c).codepoint == b'c' as u32
+                || l.cell(c).codepoint == b'd' as u32
+                || l.cell(c).codepoint == b'e' as u32
+                || l.cell(c).codepoint == b'f' as u32));
+        assert!(filled, "precondition: viewport/history must contain letters");
+
+        e.clear_terminal();
+
+        let after = e.full_snapshot();
+        assert_eq!(after.display_offset, 0);
+        assert_eq!(after.history_size, 0);
+        let leftover = after.lines.iter().any(|l| {
+            (0..l.len()).any(|c| {
+                let cp = l.cell(c).codepoint;
+                cp == b'a' as u32
+                    || cp == b'b' as u32
+                    || cp == b'c' as u32
+                    || cp == b'd' as u32
+                    || cp == b'e' as u32
+                    || cp == b'f' as u32
+            })
+        });
+        assert!(!leftover, "clear_terminal must blank letter cells");
     }
 
     #[test]
