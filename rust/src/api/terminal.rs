@@ -201,6 +201,11 @@ pub fn engine_clear_history(engine: &mut TerminalEngine) {
 }
 
 #[frb(sync)]
+pub fn engine_clear_terminal(engine: &mut TerminalEngine) {
+    engine.clear_terminal();
+}
+
+#[frb(sync)]
 pub fn engine_selection_start(
     engine: &mut TerminalEngine,
     display_row: i32,
