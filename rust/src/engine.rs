@@ -683,6 +683,7 @@ impl TerminalEngine {
         self.term.clear_screen(ClearMode::All);
         // `ClearMode::All` rotates cleared viewport lines into scrollback.
         self.term.clear_screen(ClearMode::Saved);
+        self.term.goto(0, 0);
     }
 
     pub fn set_palette(&mut self, palette: Vec<u32>) {
@@ -2169,6 +2170,23 @@ mod tests {
             })
         });
         assert!(!leftover, "clear_terminal must blank letter cells");
+    }
+
+    #[test]
+    fn clear_terminal_homes_cursor() {
+        let mut e = TerminalEngine::new(20, 8, EngineConfig::defaults());
+        e.advance(b"hello\r\nworld".to_vec());
+        let before = e.full_snapshot();
+        assert!(
+            before.cursor_line != 0 || before.cursor_col != 0,
+            "precondition: cursor must not already be at origin"
+        );
+
+        e.clear_terminal();
+
+        let after = e.full_snapshot();
+        assert_eq!(after.cursor_line, 0);
+        assert_eq!(after.cursor_col, 0);
     }
 
     #[test]
